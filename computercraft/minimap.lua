@@ -239,9 +239,11 @@ end
 -- Pocket has no relays so it skips the load entirely.
 local Lift
 local Altitude
+local Cfg  -- only used on the ship for Settings -> cfg writeback
 if not IS_POCKET then
   Lift = dofile("lift.lua")
   Altitude = dofile("altitude.lua")
+  Cfg = dofile("cfgutil.lua")
   Lift.init({
     mode = LIFT_MODE,
     channels = CHANNELS,
@@ -305,12 +307,46 @@ local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
 local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 
 local SETTINGS = {
-  { name = "Cruise AGL", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
-  { name = "Min AGL",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
-  { name = "Hover Brn",  get = function() return HOVER_BURNER end,   set = function(v) HOVER_BURNER = v end,   step = 1,  min = 0,   max = 15  },
-  { name = "Max Speed",  get = function() return MAX_SPEED end,      set = function(v) MAX_SPEED = v end,      step = 1,  min = 1,   max = 20  },
-  { name = "Max Alt",    get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
+  { name = "Cruise AGL", cfgKey = "cruiseAltitudeAboveGround", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
+  { name = "Min AGL",    cfgKey = "minAltitudeAboveGround",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
+  { name = "Hover Brn",  cfgKey = "hoverBurnerLevel",          get = function() return HOVER_BURNER end,   set = function(v) HOVER_BURNER = v end,   step = 1,  min = 0,   max = 15  },
+  { name = "Max Speed",  cfgKey = "maxSpeed",                  get = function() return MAX_SPEED end,      set = function(v) MAX_SPEED = v end,      step = 1,  min = 1,   max = 20  },
+  { name = "Max Alt",    cfgKey = "maxAltitude",               get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
 }
+
+-- Last-persisted snapshot for the Cancel button. Captured at boot from the
+-- cfg-loaded values; refreshed on every successful Save.
+local SETTINGS_SAVED = {}
+local function captureSettingsSaved()
+  for i, s in ipairs(SETTINGS) do SETTINGS_SAVED[i] = s.get() end
+end
+captureSettingsSaved()
+
+local function settingsDirty()
+  for i, s in ipairs(SETTINGS) do
+    if s.get() ~= SETTINGS_SAVED[i] then return true end
+  end
+  return false
+end
+
+-- Ship-side: write current SETTINGS values back to the cfg file via cfgutil.
+-- Pocket never reaches this path (setting_save is forwarded to the ship).
+local function saveSettings()
+  if IS_POCKET then return false end
+  for _, s in ipairs(SETTINGS) do cfg[s.cfgKey] = s.get() end
+  local f = fs.open(CONFIG_FILE, "w")
+  if not f then return false end
+  f.write(Cfg.jsonPretty(cfg) .. "\n")
+  f.close()
+  captureSettingsSaved()
+  return true
+end
+
+local function cancelSettings()
+  for i, s in ipairs(SETTINGS) do
+    if SETTINGS_SAVED[i] ~= nil then s.set(SETTINGS_SAVED[i]) end
+  end
+end
 
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
 local PLAYER_MARKER = { 0x2E, 0x1D }
@@ -1470,16 +1506,20 @@ end
 
 local function drawSettingsScreen(mapH)
   clearMapArea(mapH)
+  state.targetCells = {}
   monitor.setCursorPos(1, 1)
   monitor.setTextColor(colors.yellow); monitor.setBackgroundColor(colors.black)
-  monitor.write("SETTINGS")
+  local dirty = settingsDirty()
+  monitor.write(dirty and "SETTINGS *" or "SETTINGS")
+  local lastRow = 1
   for i, s in ipairs(SETTINGS) do
     local row = i + 1
     if row > mapH then break end
     local selected = state.settingIdx == i
+    local changed  = s.get() ~= SETTINGS_SAVED[i]
     local bg  = selected and colors.gray or colors.black
     local nfg = selected and colors.white or colors.lightGray
-    local vfg = selected and colors.yellow or colors.white
+    local vfg = changed and colors.orange or (selected and colors.yellow or colors.white)
     local namePart = string.format("%-14s", s.name)
     local valPart  = tostring(s.get())
     local pad = string.rep(" ", math.max(0, width - #namePart - #valPart))
@@ -1490,6 +1530,24 @@ local function drawSettingsScreen(mapH)
     monitor.write(valPart)
     monitor.setTextColor(nfg)
     monitor.write(pad)
+    lastRow = row
+  end
+  -- SAVE / CANCEL: tappable buttons below the list. Live when dirty, dimmed when clean.
+  local btnRow = math.min(mapH, lastRow + 2)
+  if btnRow <= mapH then
+    local saveLabel, cxlLabel = " SAVE ", " CANCEL "
+    local saveBg = dirty and colors.lime or colors.gray
+    local saveFg = dirty and colors.black or colors.lightGray
+    local cxlBg  = dirty and colors.red  or colors.gray
+    local cxlFg  = dirty and colors.white or colors.lightGray
+    local saveCol = 2
+    local cxlCol  = saveCol + #saveLabel + 2
+    monitor.setCursorPos(saveCol, btnRow)
+    monitor.setTextColor(saveFg); monitor.setBackgroundColor(saveBg); monitor.write(saveLabel)
+    monitor.setCursorPos(cxlCol, btnRow)
+    monitor.setTextColor(cxlFg);  monitor.setBackgroundColor(cxlBg);  monitor.write(cxlLabel)
+    table.insert(state.targetCells, { col1 = saveCol, col2 = saveCol + #saveLabel - 1, row = btnRow, cmd = "setting_save" })
+    table.insert(state.targetCells, { col1 = cxlCol,  col2 = cxlCol  + #cxlLabel  - 1, row = btnRow, cmd = "setting_cancel" })
   end
 end
 
@@ -1981,9 +2039,17 @@ local function applyCommand(cmd)
   elseif id == "setting_inc" then
     local s = SETTINGS[cmd.idx or state.settingIdx]
     if s then s.set(math.min(s.max, s.get() + s.step)) end
+    if state.screen == "settings" then fullRedraw() end
   elseif id == "setting_dec" then
     local s = SETTINGS[cmd.idx or state.settingIdx]
     if s then s.set(math.max(s.min, s.get() - s.step)) end
+    if state.screen == "settings" then fullRedraw() end
+  elseif id == "setting_save" then
+    saveSettings()
+    if state.screen == "settings" then fullRedraw() end
+  elseif id == "setting_cancel" then
+    cancelSettings()
+    if state.screen == "settings" then fullRedraw() end
   end
 end
 
@@ -2078,6 +2144,7 @@ local function stateSnapshot()
     hoverBurner     = HOVER_BURNER,
     maxSpeed        = MAX_SPEED,
     maxAlt          = MAX_ALT,
+    settingsSaved   = SETTINGS_SAVED,   -- so pocket can flag dirty/clean accurately
     customControls     = state.customControls,
     customControlsMeta = CUSTOM_CONTROLS, -- schema so pocket renders the ship's actual control list
   }
@@ -2148,6 +2215,11 @@ local function rednetLoop()
           if msg.maxAlt         then MAX_ALT               = msg.maxAlt         end
           if type(msg.customControls) == "table" then state.customControls = msg.customControls end
           if type(msg.customControlsMeta) == "table" then CUSTOM_CONTROLS = msg.customControlsMeta end
+          if type(msg.settingsSaved) == "table" then
+            for i = 1, #SETTINGS do
+              if msg.settingsSaved[i] ~= nil then SETTINGS_SAVED[i] = msg.settingsSaved[i] end
+            end
+          end
           state.lastUpdateAt = os.clock()
         end
       end
