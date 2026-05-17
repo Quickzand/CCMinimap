@@ -85,6 +85,18 @@ if not fs.exists(CONFIG_FILE) then
       "side": "back"
     }
   },
+  "customControls": [
+    {
+      "name": "Platform",
+      "relay": "redstone_relay_6",
+      "side": "back",
+      "mode": "toggle",
+      "inverted": true,
+      "activeLabel": "LOWERING",
+      "inactiveLabel": "RAISED",
+      "activeColor": "orange"
+    }
+  ],
   "liftMode": "burner",
   "useAltimeter": true,
   "useVelocitySensor": true,
@@ -170,8 +182,37 @@ local CHANNELS = {
   right    = cfgChannel("right",    { relay = "redstone_relay_0", side = "right" }),
   liftUp   = cfgChannel("liftUp",   { relay = "redstone_relay_1", side = "right" }),
   liftDown = cfgChannel("liftDown", { relay = "redstone_relay_1", side = "left"  }),
-  platform = cfgChannel("platform", { relay = "redstone_relay_6", side = "back"  }),
 }
+
+-- User-defined redstone toggles surfaced as tappable rows on the Controls
+-- screen. Each entry registers a channel into CHANNELS under its `name` so
+-- setControl(name, on) works. `inverted` means active = LOW (e.g. a platform
+-- that lowers when redstone power is removed). `mode` is reserved for a
+-- future "pulse" type; only "toggle" is implemented today.
+local DEFAULT_CUSTOM_CONTROLS = {
+  { name = "Platform", relay = "redstone_relay_6", side = "back",
+    mode = "toggle", inverted = true,
+    activeLabel = "LOWERING", inactiveLabel = "RAISED", activeColor = "orange" },
+}
+local CUSTOM_CONTROLS = {}
+do
+  -- Absent key -> defaults. Explicit empty array -> respect it (user wants no controls).
+  local src = (type(cfg.customControls) == "table") and cfg.customControls or DEFAULT_CUSTOM_CONTROLS
+  for _, e in ipairs(src) do
+    if type(e) == "table" and type(e.name) == "string"
+       and type(e.relay) == "string" and type(e.side) == "string" then
+      CHANNELS[e.name] = { relay = e.relay, side = e.side }
+      CUSTOM_CONTROLS[#CUSTOM_CONTROLS + 1] = {
+        name          = e.name,
+        mode          = (e.mode == "pulse") and "pulse" or "toggle",
+        inverted      = (e.inverted == true),
+        activeLabel   = tostring(e.activeLabel or "ON"),
+        inactiveLabel = tostring(e.inactiveLabel or "OFF"),
+        activeColor   = tostring(e.activeColor or "orange"),
+      }
+    end
+  end
+end
 local INPUTS = {
   liftLevel = cfgInput("liftLevel"),
 }
@@ -322,7 +363,8 @@ local state = {
   screen = "map",
   wpScroll = 0,
   settingIdx = 1,
-  platformActive = false,
+  pinLock = false,     -- when true, map taps don't drop a pin (prevents fat-finger overwrite of current target)
+  customControls = {}, -- map: custom control name -> active bool
   status = "starting",
   running = true,
   players = {},
@@ -1343,6 +1385,10 @@ end
 
 local function drawControlsScreen(mapH)
   clearMapArea(mapH)
+  -- fastTick calls us every tick; reset here so the tappable rows we push
+  -- below don't accumulate between fullRedraws (fullRedraw already clears,
+  -- so this is a no-op there).
+  state.targetCells = {}
   local row = 2
   local function readout(label, value, fg)
     monitor.setCursorPos(2, row)
@@ -1401,16 +1447,23 @@ local function drawControlsScreen(mapH)
   if state.engaged and state.autoStatus ~= "" then
     readout("AUTO", state.autoStatus, colors.lime)
   end
-  -- Platform: tappable row in the body
-  do
-    local active = state.platformActive
-    local fg = active and colors.orange or colors.white
-    local bg = active and colors.gray   or colors.black
-    local label = active and "PLATFORM  [ LOWERING ]" or "PLATFORM  [  RAISED  ]"
+  -- Custom controls: one tappable row per cfg.customControls entry.
+  for _, ctl in ipairs(CUSTOM_CONTROLS) do
+    if row > mapH then break end
+    local active = state.customControls[ctl.name] == true
+    local fg = active and (HEX_TO_COLOR[paletteHexFor(ctl.activeColor)] or colors.orange)
+                       or colors.white
+    local bg = active and colors.gray or colors.black
+    local label = string.format("%-10s[ %s ]",
+      ctl.name:upper():sub(1, 9),
+      active and ctl.activeLabel or ctl.inactiveLabel)
     monitor.setCursorPos(2, row)
     monitor.setTextColor(fg); monitor.setBackgroundColor(bg)
     monitor.write(label:sub(1, width - 1))
-    table.insert(state.targetCells, { col1 = 2, col2 = width, row = row, cmd = "platform_toggle" })
+    table.insert(state.targetCells, {
+      col1 = 2, col2 = width, row = row,
+      cmd = "custom_toggle", name = ctl.name,
+    })
     row = row + 1
   end
 end
@@ -1518,6 +1571,10 @@ local function drawOsd(x, y, z)
     drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
     drawButton("zoom_out", col, btnRow, " - "); col = col + 3
     drawButton("lod",      col, btnRow, " L" .. state.lod); col = col + 3
+    -- PIN lock: yellow bg when active blocks tap-to-pin so the current
+    -- target can't be accidentally overwritten by a stray map tap.
+    local pinBg = state.pinLock and colors.yellow or colors.lightGray
+    drawButton("pin_lock_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
     if state.target then
       col = col + 1
       local autoLabel = state.engaged and " STOP " or " AUTO "
@@ -1887,6 +1944,9 @@ local function applyCommand(cmd)
   elseif id == "screen_controls"  then state.screen = "controls";  fullRedraw()
   elseif id == "screen_settings"  then state.screen = "settings";  fullRedraw()
 
+  elseif id == "pin_lock_toggle" then
+    state.pinLock = not state.pinLock
+
   elseif id == "wp_scroll_up" then
     state.wpScroll = math.max(0, state.wpScroll - 1)
   elseif id == "wp_scroll_down" then
@@ -1894,9 +1954,18 @@ local function applyCommand(cmd)
     local maxScroll = math.max(0, total - (mapHeight() - 1))
     state.wpScroll = math.min(maxScroll, state.wpScroll + 1)
 
-  elseif id == "platform_toggle" then
-    state.platformActive = not state.platformActive
-    setControl("platform", not state.platformActive)  -- LOW = lowering, HIGH = raised
+  elseif id == "custom_toggle" then
+    local name = cmd.name
+    if type(name) ~= "string" then return end
+    local ctl
+    for _, c in ipairs(CUSTOM_CONTROLS) do
+      if c.name == name then ctl = c; break end
+    end
+    if not ctl then return end
+    local active = not (state.customControls[name] == true)
+    state.customControls[name] = active
+    -- inverted: active = LOW signal; normal: active = HIGH signal
+    setControl(name, ctl.inverted and (not active) or active)
 
   elseif id == "burner_up" then
     local lvl = math.min(15, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) + 1)
@@ -1923,6 +1992,7 @@ local LOCAL_CMDS = {
   screen_map=true, screen_waypoints=true, screen_controls=true, screen_settings=true,
   wp_scroll_up=true, wp_scroll_down=true,
   setting_prev=true, setting_next=true,
+  pin_lock_toggle=true,
 }
 
 -- Pocket forwards every command to the ship over rednet, signed with the
@@ -1956,7 +2026,7 @@ local function handleTouch(_, side, x, y)
   for _, t in ipairs(state.targetCells or {}) do
     if y == t.row and x >= t.col1 and x <= t.col2 then
       if t.cmd then
-        dispatchCommand({ cmd = t.cmd })
+        dispatchCommand({ cmd = t.cmd, name = t.name })
       else
         dispatchCommand({
           cmd = "set_target",
@@ -1966,8 +2036,9 @@ local function handleTouch(_, side, x, y)
       return
     end
   end
-  -- Map tap: place a pin at the tapped world location
-  if state.screen == "map" and state.lastPos and state.lastFrame and y <= mapHeight() then
+  -- Map tap: place a pin at the tapped world location (unless PIN lock is on).
+  if state.screen == "map" and not state.pinLock
+     and state.lastPos and state.lastFrame and y <= mapHeight() then
     local wx, wz = cellToWorld(x, y, state.lastPos.x, state.lastPos.z, mapHeight())
     dispatchCommand({
       cmd = "set_target",
@@ -2005,7 +2076,10 @@ local function stateSnapshot()
     cruiseAltAgl    = CRUISE_ALT_AGL,
     minAltAgl       = MIN_ALT_AGL,
     hoverBurner     = HOVER_BURNER,
-    platformActive  = state.platformActive,
+    maxSpeed        = MAX_SPEED,
+    maxAlt          = MAX_ALT,
+    customControls     = state.customControls,
+    customControlsMeta = CUSTOM_CONTROLS, -- schema so pocket renders the ship's actual control list
   }
 end
 
@@ -2070,7 +2144,10 @@ local function rednetLoop()
           if msg.cruiseAltAgl   then CRUISE_ALT_AGL        = msg.cruiseAltAgl   end
           if msg.minAltAgl      then MIN_ALT_AGL           = msg.minAltAgl      end
           if msg.hoverBurner    then HOVER_BURNER          = msg.hoverBurner    end
-          if msg.platformActive ~= nil then state.platformActive = msg.platformActive end
+          if msg.maxSpeed       then MAX_SPEED             = msg.maxSpeed       end
+          if msg.maxAlt         then MAX_ALT               = msg.maxAlt         end
+          if type(msg.customControls) == "table" then state.customControls = msg.customControls end
+          if type(msg.customControlsMeta) == "table" then CUSTOM_CONTROLS = msg.customControlsMeta end
           state.lastUpdateAt = os.clock()
         end
       end
