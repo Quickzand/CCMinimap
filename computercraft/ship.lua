@@ -34,7 +34,7 @@ end
 
 local cfg = readConfig()
 local AIRSHIP_NAME   = tostring(cfg.airshipName or "main")
-local CONTROL_SECRET = tostring(cfg.controlSecret or "changeme")
+local CONTROL_SECRET = tostring(cfg.controlSecret or "")
 local SHIP_HOSTNAME  = SHIP_HOST .. "-" .. AIRSHIP_NAME
 
 local function openWirelessModem()
@@ -155,6 +155,69 @@ commands["wp"] = function(args)
   print("wp " .. name)
 end
 
+-- Set or clear the control password locally. Pocket stores plaintext (its
+-- threat model permits it -- the pocket lives in your inventory); ship stores
+-- only the SHA-256 hash so a looted ship leaks no recoverable password. The
+-- two devices are configured independently: type the same password on each.
+-- Reboots after writing so the running minimap picks up the new value.
+commands["password"] = function(args)
+  local newPw = args[1] or ""
+  local cfgPath
+  if pocket then
+    cfgPath = "minimap-pocket.cfg"
+  elseif isShip() then
+    cfgPath = "minimap.cfg"
+  else
+    print("run `minimap password` on the ship or the pocket")
+    return
+  end
+  if not fs.exists(cfgPath) then
+    print(cfgPath .. " not found; reboot once to create it")
+    return
+  end
+  local f = fs.open(cfgPath, "r")
+  local raw = f.readAll(); f.close()
+  local ok, c = pcall(textutils.unserialiseJSON, raw)
+  if not ok or type(c) ~= "table" then
+    print("can't parse " .. cfgPath)
+    return
+  end
+
+  if pocket then
+    c.controlSecret = newPw
+  else
+    if not fs.exists("sha256.lua") then
+      print("sha256.lua missing; reboot to fetch it then retry")
+      return
+    end
+    local Sha = dofile("sha256.lua")
+    c.controlSecret = nil
+    c.controlSecretHash = (newPw == "") and "" or Sha.hash(newPw)
+    c.authVersion = 1
+  end
+
+  local body
+  if fs.exists("cfgutil.lua") then
+    local Cfg = dofile("cfgutil.lua")
+    body = Cfg.jsonPretty(c) .. "\n"
+  else
+    body = textutils.serialiseJSON(c)
+  end
+  if fs.exists(cfgPath) then fs.delete(cfgPath) end
+  f = fs.open(cfgPath, "w"); f.write(body); f.close()
+
+  if newPw == "" then
+    print("password cleared on this " .. (pocket and "pocket" or "ship"))
+  elseif pocket then
+    print("password set on this pocket (plaintext on disk)")
+  else
+    print("password set on this ship (hash stored, plaintext discarded)")
+  end
+  print("rebooting to apply...")
+  sleep(0.5)
+  os.reboot()
+end
+
 commands["status"] = function()
   local s
   if isShip() or pocket then
@@ -174,6 +237,7 @@ commands["help"] = function()
   print("  minimap hold [alt]       toggle altitude hold (optional alt)")
   print("  minimap wp <name>        autopilot to a named waypoint")
   print("  minimap status           position / heading / mode")
+  print("  minimap password [<p>]   set/clear control password (per device)")
   print("")
   print("Each subcommand also exists as a bare shim, e.g. `goto 100 200`.")
 end

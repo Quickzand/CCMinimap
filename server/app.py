@@ -206,7 +206,9 @@ def create_app() -> Flask:
         "showAltitudeTape",
         "maxAltitude",
         "airshipName",     # must match ship's value to discover it
-        "controlSecret",   # must match ship's value to authenticate commands
+        # Pocket holds the password in plaintext (its threat model permits it);
+        # the ship stores only the SHA-256 hash and verifies on receive.
+        "controlSecret",
     }
 
     @app.get("/config.defaults.pocket")
@@ -255,6 +257,10 @@ def create_app() -> Flask:
     @app.get("/cfgutil.lua")
     def cfgutil_lua():
         return serve_lua("/app/computercraft/cfgutil.lua")
+
+    @app.get("/sha256.lua")
+    def sha256_lua():
+        return serve_lua("/app/computercraft/sha256.lua")
 
     return app
 

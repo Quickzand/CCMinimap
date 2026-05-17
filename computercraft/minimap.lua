@@ -118,7 +118,9 @@ if not fs.exists(CONFIG_FILE) then
   "landRampSeconds": 2.0,
   "playerName": "",
   "airshipName": "main",
-  "controlSecret": "changeme"
+  "controlSecret": "",
+  "controlSecretHash": "",
+  "authVersion": 1
 }
 ]])
   f.close()
@@ -139,11 +141,42 @@ if type(cfg.playerName) == "string" and cfg.playerName ~= "" then
   PLAYER_NAME = cfg.playerName
 end
 -- Pairing: AIRSHIP_NAME makes the rednet hostname unique per ship, so a
--- pocket only discovers its own ship. CONTROL_SECRET is a shared password
--- the pocket attaches to every command and the ship verifies; without a
--- match, the command is dropped. Must match between ship and pocket cfgs.
-local AIRSHIP_NAME      = tostring(cfg.airshipName or "main")
-local CONTROL_SECRET    = tostring(cfg.controlSecret or "changeme")
+-- pocket only discovers its own ship.
+--
+-- Auth: pocket holds plaintext (CONTROL_SECRET) in its cfg; ship holds only
+-- the SHA-256 hash (CONTROL_SECRET_HASH). Pocket attaches the plaintext to
+-- every command; ship hashes the received value and compares. Empty hash on
+-- the ship means "no password set, accept anything" -- the open default
+-- before the operator runs `minimap password`. authVersion is reserved for
+-- a future challenge-response upgrade (v2) that keeps the same disk shape,
+-- so flipping it later won't require re-pairing.
+local AIRSHIP_NAME       = tostring(cfg.airshipName or "main")
+local CONTROL_SECRET     = tostring(cfg.controlSecret or "")
+local CONTROL_SECRET_HASH = tostring(cfg.controlSecretHash or "")
+local Sha = dofile("sha256.lua")
+
+-- Ship migration: if a legacy plaintext controlSecret still exists on disk,
+-- hash it into controlSecretHash and strip the plaintext. One-shot per ship.
+if not IS_POCKET and CONTROL_SECRET ~= "" then
+  CONTROL_SECRET_HASH = Sha.hash(CONTROL_SECRET)
+  cfg.controlSecretHash = CONTROL_SECRET_HASH
+  cfg.controlSecret = nil
+  CONTROL_SECRET = ""
+  local ok, Cfg = pcall(dofile, "cfgutil.lua")
+  if ok and Cfg and Cfg.jsonPretty then
+    local body = Cfg.jsonPretty(cfg) .. "\n"
+    if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
+    local fh = fs.open(CONFIG_FILE, "w")
+    fh.write(body); fh.close()
+    print("migrated controlSecret -> controlSecretHash")
+  end
+end
+
+local function authOk(msg)
+  if CONTROL_SECRET_HASH == "" then return true end
+  local got = (type(msg) == "table" and type(msg.secret) == "string") and msg.secret or ""
+  return Sha.hash(got) == CONTROL_SECRET_HASH
+end
 
 local function cfgChannel(name, defaults)
   local cs = cfg.channels
@@ -2228,7 +2261,7 @@ local function rednetLoop()
     local nextBroadcast = 0
     while state.running do
       local id, msg = rednet.receive(CMD_PROTOCOL, 0.1)
-      if id and type(msg) == "table" and msg.secret == CONTROL_SECRET then
+      if id and type(msg) == "table" and authOk(msg) then
         applyCommand(msg)
       end
       if os.clock() >= nextBroadcast then
