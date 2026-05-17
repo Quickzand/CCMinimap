@@ -1659,8 +1659,8 @@ local function drawOsd(x, y, z)
   col = col + 1
 
   if state.screen == "map" then
-    drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
     drawButton("zoom_out", col, btnRow, " - "); col = col + 3
+    drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
     drawButton("lod",      col, btnRow, " L" .. state.lod); col = col + 3
     -- PIN lock: yellow bg when active blocks tap-to-pin so the current
     -- target can't be accidentally overwritten by a stray map tap.
