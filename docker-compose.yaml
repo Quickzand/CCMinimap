@@ -1,0 +1,34 @@
+services:
+  bluemap-minimap:
+    build: .
+    restart: always
+    environment:
+      # Upstream BlueMap server the proxy fetches tiles from.
+      BLUEMAP_BASE_URL: ${BLUEMAP_BASE_URL:?set BLUEMAP_BASE_URL in .env}
+      BLUEMAP_MAP_ID: ${BLUEMAP_MAP_ID:?set BLUEMAP_MAP_ID in .env}
+      BLUEMAP_CACHE_DIR: ${BLUEMAP_CACHE_DIR:-/cache}
+      BLUEMAP_TIMEOUT_SECONDS: ${BLUEMAP_TIMEOUT_SECONDS:-10}
+      # Substituted into served .lua files. CLIENT_SERVER_URL is how the CC
+      # computers reach this service from inside Minecraft. CLIENT_PLAYER_NAME
+      # is your in-game name, used to skip drawing your own player marker
+      # (multi-user installs can override per-CC via minimap.cfg.playerName).
+      CLIENT_SERVER_URL: ${CLIENT_SERVER_URL:?set CLIENT_SERVER_URL in .env}
+      CLIENT_PLAYER_NAME: ${CLIENT_PLAYER_NAME:-}
+    command: ["gunicorn", "--bind", "0.0.0.0:5055", "--workers", "1", "--threads", "2", "--timeout", "30", "--access-logfile", "-", "app:app"]
+    mem_limit: 96m
+    memswap_limit: 96m
+    ports:
+      - "5055:5055"
+    volumes:
+      - bluemap-minimap-cache:/cache
+      - ./waypoints.json:/app/waypoints.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  bluemap-minimap-cache:

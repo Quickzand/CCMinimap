@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Origin",
+    "x": 0,
+    "z": 0,
+    "color": "yellow"
+  },
+  {
+    "name": "Base",
+    "x": 100,
+    "z": -250,
+    "color": "blue"
+  }
+]

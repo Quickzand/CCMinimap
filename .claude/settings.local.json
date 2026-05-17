@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ipconfig)",
+      "Bash(findstr /i \"IPv4\")",
+      "PowerShell(\\(Invoke-WebRequest -Uri \"https://api.ipify.org\" -UseBasicParsing\\).Content)",
+      "PowerShell(curl http://localhost:5055/health)",
+      "WebFetch(domain:canyouseeme.org)",
+      "Bash(ipconfig /all)",
+      "Bash(ipconfig /release)",
+      "Bash(ipconfig /renew)",
+      "Bash(docker compose *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ]
+  }
+}
