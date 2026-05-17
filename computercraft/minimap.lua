@@ -170,6 +170,7 @@ local CHANNELS = {
   right    = cfgChannel("right",    { relay = "redstone_relay_0", side = "right" }),
   liftUp   = cfgChannel("liftUp",   { relay = "redstone_relay_1", side = "right" }),
   liftDown = cfgChannel("liftDown", { relay = "redstone_relay_1", side = "left"  }),
+  platform = cfgChannel("platform", { relay = "redstone_relay_6", side = "back"  }),
 }
 local INPUTS = {
   liftLevel = cfgInput("liftLevel"),
@@ -262,6 +263,14 @@ local LANDED_VY_THRESH  = 0.1
 local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
 local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 
+local SETTINGS = {
+  { name = "Cruise AGL", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
+  { name = "Min AGL",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
+  { name = "Hover Brn",  get = function() return HOVER_BURNER end,   set = function(v) HOVER_BURNER = v end,   step = 1,  min = 0,   max = 15  },
+  { name = "Max Speed",  get = function() return MAX_SPEED end,      set = function(v) MAX_SPEED = v end,      step = 1,  min = 1,   max = 20  },
+  { name = "Max Alt",    get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
+}
+
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
 local PLAYER_MARKER = { 0x2E, 0x1D }
 
@@ -310,6 +319,10 @@ local state = {
   shipId = nil,         -- pocket: rednet id of the ship after lookup
   lastUpdateAt = 0,     -- pocket: os.clock() when last state broadcast received
   lastDialCells = {},   -- same idea for the speedometer needle
+  screen = "map",
+  wpScroll = 0,
+  settingIdx = 1,
+  platformActive = false,
   status = "starting",
   running = true,
   players = {},
@@ -464,6 +477,15 @@ local function worldToCell(wx, wz, cx, cz, mapH)
   local col = math.floor((wx - cx) / bX + width / 2 + 0.5)
   local row = math.floor((wz - cz) / bY + mapH / 2 + 0.5)
   return col, row
+end
+
+-- Inverse of worldToCell: screen cell → approximate world coordinate.
+local function cellToWorld(col, row, cx, cz, mapH)
+  local bX = state.bpp * SUB_W
+  local bY = state.bpp * SUB_H
+  local wx = (col - width  / 2) * bX + cx
+  local wz = (row - mapH / 2) * bY + cz
+  return wx, wz
 end
 
 -- (directionForHeading was only used by the stencil arrow; the needle uses the
@@ -644,6 +666,15 @@ local function paletteHexFor(name)
   return NAMED_HEX[(name or ""):lower()] or "1"
 end
 
+local HEX_TO_COLOR = {
+  ["0"]=colors.white,    ["1"]=colors.orange,    ["2"]=colors.magenta,
+  ["3"]=colors.lightBlue,["4"]=colors.yellow,    ["5"]=colors.lime,
+  ["6"]=colors.pink,     ["7"]=colors.gray,      ["8"]=colors.lightGray,
+  ["9"]=colors.cyan,     ["a"]=colors.purple,    ["b"]=colors.blue,
+  ["c"]=colors.brown,    ["d"]=colors.green,     ["e"]=colors.red,
+  ["f"]=colors.black,
+}
+
 local function overlayWaypoints(cx, cz, mapH)
   for _, wp in ipairs(state.waypoints or {}) do
     if wp.x and wp.z then
@@ -659,6 +690,64 @@ local function overlayWaypoints(cx, cz, mapH)
         x = wp.x, z = wp.z, color = color,
       })
     end
+  end
+end
+
+local function overlayMarkerLabels(cx, cz, mapH)
+  -- Draw name next to every visible player marker
+  for _, p in ipairs(state.players or {}) do
+    if p.name ~= PLAYER_NAME and p.position then
+      local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
+      if row >= 1 and row <= mapH then
+        local name = p.name:sub(1, 9)
+        local lx = col + 2
+        if lx + #name - 1 > width then lx = math.max(1, col - #name - 1) end
+        if lx >= 1 then
+          local hexColor = colorForPlayer(p.uuid or p.name or "?")
+          monitor.setCursorPos(lx, row)
+          monitor.setTextColor(HEX_TO_COLOR[hexColor] or colors.cyan)
+          monitor.setBackgroundColor(colors.black)
+          monitor.write(name:sub(1, math.max(0, width - lx + 1)))
+        end
+      end
+    end
+  end
+  -- Draw name next to the selected target (waypoint or player already covered above)
+  if state.target and state.target.name and state.target.kind == "waypoint" then
+    local col, row = worldToCell(state.target.x, state.target.z, cx, cz, mapH)
+    if row >= 1 and row <= mapH then
+      local name = state.target.name:sub(1, 10)
+      local lx = col + 2
+      if lx + #name - 1 > width then lx = math.max(1, col - #name - 1) end
+      if lx >= 1 then
+        monitor.setCursorPos(lx, row)
+        monitor.setTextColor(HEX_TO_COLOR[state.target.color] or colors.yellow)
+        monitor.setBackgroundColor(colors.black)
+        monitor.write(name:sub(1, math.max(0, width - lx + 1)))
+      end
+    end
+  end
+end
+
+local function overlayPin(cx, cz, mapH)
+  if not state.target or state.target.kind ~= "pin" then return end
+  local col, row = worldToCell(state.target.x, state.target.z, cx, cz, mapH)
+  if row < 1 or row > mapH then return end
+  local mc = math.max(1, math.min(width - 2, col))
+  -- Draw [+] in orange as plain text over the blit map
+  monitor.setCursorPos(mc, row)
+  monitor.setTextColor(colors.orange)
+  monitor.setBackgroundColor(colors.black)
+  monitor.write(("[+]"):sub(1, width - mc + 1))
+  -- Label to the right (or left if near edge)
+  local name = (state.target.name or "Pin"):sub(1, 8)
+  local lx = mc + 3
+  if lx + #name - 1 > width then lx = math.max(1, mc - #name - 1) end
+  if lx >= 1 and lx <= width then
+    monitor.setCursorPos(lx, row)
+    monitor.setTextColor(colors.orange)
+    monitor.setBackgroundColor(colors.black)
+    monitor.write(name:sub(1, width - lx + 1))
   end
 end
 
@@ -1172,6 +1261,185 @@ local function autopilotTick()
   altitudeController()
 end
 
+local function clearMapArea(mapH)
+  monitor.setBackgroundColor(colors.black)
+  for r = 1, mapH do
+    monitor.setCursorPos(1, r)
+    monitor.clearLine()
+  end
+end
+
+local function drawWaypointsScreen(mapH)
+  clearMapArea(mapH)
+  -- Build combined list: online players first, then waypoints
+  local items = {}
+  for _, p in ipairs(state.players or {}) do
+    if p.name and p.position then
+      table.insert(items, {
+        kind = "player", name = p.name,
+        x = p.position.x, z = p.position.z, color = nil,
+      })
+    end
+  end
+  for _, wp in ipairs(state.waypoints or {}) do
+    if wp.x and wp.z then
+      table.insert(items, {
+        kind = "waypoint", name = wp.name,
+        x = wp.x, z = wp.z, color = wp.color,
+      })
+    end
+  end
+  state.wpTotalItems = #items
+
+  local wCount = #(state.waypoints or {})
+  local pCount = #(state.players or {})
+  monitor.setCursorPos(1, 1)
+  monitor.setTextColor(colors.yellow); monitor.setBackgroundColor(colors.black)
+  monitor.write(string.format("WP:%d  Players:%d", wCount, pCount))
+
+  state.targetCells = {}
+  local visRows = mapH - 1
+  for i = 1, visRows do
+    local idx  = i + state.wpScroll
+    local item = items[idx]
+    local row  = i + 1
+    if row > mapH then break end
+    monitor.setCursorPos(1, row)
+    monitor.setBackgroundColor(colors.black); monitor.clearLine()
+    if item then
+      local isPlayer  = item.kind == "player"
+      local selected  = isSelected(item.kind, item.name)
+      local dist = ""
+      if state.lastPos then
+        local dx = item.x - state.lastPos.x
+        local dz = item.z - state.lastPos.z
+        dist = string.format(" %dm", math.floor(math.sqrt(dx*dx + dz*dz)))
+      end
+      local prefix = isPlayer and "@" or (selected and ">" or " ")
+      local fg = isPlayer and colors.cyan
+                           or (HEX_TO_COLOR[paletteHexFor(item.color)] or colors.white)
+      local bg = selected and colors.gray or colors.black
+      local nameStr = string.format("%-14s", (item.name or "?"):sub(1, 14))
+      local line
+      if isPlayer then
+        line = prefix .. nameStr .. dist
+      else
+        line = prefix .. nameStr
+             .. string.format("X%-5d Z%-5d", item.x, item.z) .. dist
+      end
+      monitor.setCursorPos(1, row)
+      monitor.setTextColor(fg)
+      monitor.setBackgroundColor(bg)
+      monitor.write(line:sub(1, width))
+      table.insert(state.targetCells, {
+        col1 = 1, col2 = width, row = row,
+        kind = item.kind, name = item.name,
+        x = item.x, z = item.z,
+        color = isPlayer and "b" or paletteHexFor(item.color),
+      })
+    end
+  end
+end
+
+local function drawControlsScreen(mapH)
+  clearMapArea(mapH)
+  local row = 2
+  local function readout(label, value, fg)
+    monitor.setCursorPos(2, row)
+    monitor.setTextColor(colors.lightGray); monitor.setBackgroundColor(colors.black)
+    monitor.write(string.format("%-10s", label))
+    monitor.setTextColor(fg or colors.white)
+    monitor.write(value or "--")
+    row = row + 1
+  end
+  local altStr = state.altitude    and string.format("%dm",      math.floor(state.altitude + 0.5))       or "--"
+  local aglStr = (state.altitude and state.groundY)
+                 and string.format("%dm", math.floor(state.altitude - state.groundY + 0.5))              or "--"
+  local gndStr = state.groundY     and string.format("%dm",      state.groundY)                          or "--"
+  local spdStr = state.velocity    and string.format("%.1fm/s",  state.velocity)                         or "--"
+  local vyStr  = state.vy          and string.format("%+.1fm/s", state.vy)                               or "--"
+  local hdgStr = state.shipHeading and string.format("%d\xb0",   math.floor(state.shipHeading + 0.5))    or "--"
+  readout("ALT",     altStr, colors.yellow)
+  readout("AGL",     aglStr, colors.orange)
+  readout("GROUND",  gndStr, colors.brown)
+  readout("SPEED",   spdStr, colors.lime)
+  local vyFg = state.vy and (state.vy > 0.1 and colors.lime or state.vy < -0.1 and colors.red or colors.white) or colors.white
+  readout("VERT",    vyStr,  vyFg)
+  readout("HEADING", hdgStr, colors.cyan)
+  -- Burner bar
+  do
+    local lvl    = state.burnerLevel or 0
+    local barW   = math.max(4, width - 15)
+    local filled = math.floor(lvl / 15 * barW + 0.5)
+    monitor.setCursorPos(2, row)
+    monitor.setTextColor(colors.lightGray); monitor.setBackgroundColor(colors.black)
+    monitor.write(string.format("%-10s", "BURNER"))
+    monitor.setTextColor(colors.yellow);  monitor.write("[")
+    monitor.setTextColor(colors.lime);    monitor.write(string.rep("=", filled))
+    monitor.setTextColor(colors.gray);    monitor.write(string.rep("-", barW - filled))
+    monitor.setTextColor(colors.yellow);  monitor.write("]")
+    monitor.setTextColor(colors.white);   monitor.write(string.format(" %2d", lvl))
+    row = row + 1
+  end
+  -- ALT LOCK: tappable row
+  do
+    local active = state.altHoldActive
+    local fg = active and colors.yellow or colors.white
+    local bg = active and colors.gray   or colors.black
+    local label
+    if active and state.altHoldTarget then
+      label = string.format("ALT LOCK  [ ON @ %dm ]", math.floor(state.altHoldTarget + 0.5))
+    else
+      label = "ALT LOCK  [  OFF  ]"
+    end
+    monitor.setCursorPos(2, row)
+    monitor.setTextColor(fg); monitor.setBackgroundColor(bg)
+    monitor.write(label:sub(1, width - 1))
+    table.insert(state.targetCells, { col1 = 2, col2 = width, row = row, cmd = "alt" })
+    row = row + 1
+  end
+  if state.engaged and state.autoStatus ~= "" then
+    readout("AUTO", state.autoStatus, colors.lime)
+  end
+  -- Platform: tappable row in the body
+  do
+    local active = state.platformActive
+    local fg = active and colors.orange or colors.white
+    local bg = active and colors.gray   or colors.black
+    local label = active and "PLATFORM  [ LOWERING ]" or "PLATFORM  [  RAISED  ]"
+    monitor.setCursorPos(2, row)
+    monitor.setTextColor(fg); monitor.setBackgroundColor(bg)
+    monitor.write(label:sub(1, width - 1))
+    table.insert(state.targetCells, { col1 = 2, col2 = width, row = row, cmd = "platform_toggle" })
+    row = row + 1
+  end
+end
+
+local function drawSettingsScreen(mapH)
+  clearMapArea(mapH)
+  monitor.setCursorPos(1, 1)
+  monitor.setTextColor(colors.yellow); monitor.setBackgroundColor(colors.black)
+  monitor.write("SETTINGS")
+  for i, s in ipairs(SETTINGS) do
+    local row = i + 1
+    if row > mapH then break end
+    local selected = state.settingIdx == i
+    local bg  = selected and colors.gray or colors.black
+    local nfg = selected and colors.white or colors.lightGray
+    local vfg = selected and colors.yellow or colors.white
+    local namePart = string.format("%-14s", s.name)
+    local valPart  = tostring(s.get())
+    local pad = string.rep(" ", math.max(0, width - #namePart - #valPart))
+    monitor.setCursorPos(1, row)
+    monitor.setTextColor(nfg); monitor.setBackgroundColor(bg)
+    monitor.write(namePart)
+    monitor.setTextColor(vfg)
+    monitor.write(valPart)
+    monitor.setTextColor(nfg)
+    monitor.write(pad)
+  end
+end
+
 local function drawText(x, y, text, fg, bg)
   monitor.setCursorPos(x, y)
   monitor.setTextColor(fg or colors.white)
@@ -1179,67 +1447,177 @@ local function drawText(x, y, text, fg, bg)
   monitor.write(text)
 end
 
-local function drawButton(id, x, y, label)
+local function drawButton(id, x, y, label, fg, bg)
   buttons[id] = { x1 = x, y1 = y, x2 = x + #label - 1, y2 = y }
-  drawText(x, y, label, colors.black, colors.lightGray)
+  drawText(x, y, label, fg or colors.black, bg or colors.lightGray)
+end
+
+local function autoStatusColor(status)
+  if not status or status == "" then return colors.white, colors.black end
+  if status:find("CLIMB") then return colors.black, colors.yellow end
+  if status == "LAND" or status == "LANDED" or status == "ARRIVED" then
+    return colors.black, colors.orange
+  end
+  if status:find("TURN") or status:find("FWD") then return colors.black, colors.lime end
+  return colors.white, colors.gray
+end
+
+local function fmtEta(secs)
+  if secs < 60 then return string.format("%ds", math.floor(secs)) end
+  return string.format("%dm%02ds", math.floor(secs / 60), math.floor(secs % 60))
+end
+
+local NAV_TABS = {
+  { id = "screen_map",       label = " M ",  screen = "map"       },
+  { id = "screen_waypoints", label = " WP ", screen = "waypoints" },
+  { id = "screen_controls",  label = " C ",  screen = "controls"  },
+  { id = "screen_settings",  label = " S ",  screen = "settings"  },
+}
+
+-- Draws a list of {text, color} pairs left-to-right starting at (startCol, row).
+local function drawSegments(startCol, row, segments)
+  local cx = startCol
+  monitor.setBackgroundColor(colors.black)
+  for _, seg in ipairs(segments) do
+    if cx > width then break end
+    local text = tostring(seg[1]):sub(1, width - cx + 1)
+    if #text > 0 then
+      monitor.setCursorPos(cx, row)
+      monitor.setTextColor(seg[2])
+      monitor.write(text)
+      cx = cx + #text
+    end
+  end
+  return cx
 end
 
 local function drawOsd(x, y, z)
   local btnRow, coordRow
   if IS_POCKET then
-    btnRow = height - 1
+    btnRow   = height - 1
     coordRow = height
-    monitor.setCursorPos(1, btnRow); monitor.setBackgroundColor(colors.black); monitor.clearLine()
+    monitor.setCursorPos(1, btnRow);   monitor.setBackgroundColor(colors.black); monitor.clearLine()
     monitor.setCursorPos(1, coordRow); monitor.setBackgroundColor(colors.black); monitor.clearLine()
   else
-    btnRow = height
+    btnRow   = height
     coordRow = height
     monitor.setCursorPos(1, btnRow); monitor.setBackgroundColor(colors.black); monitor.clearLine()
   end
   buttons = {}
   local col = 1
-  drawButton("zoom_in", col, btnRow, " + "); col = col + 3
-  drawButton("zoom_out", col, btnRow, " - "); col = col + 3
-  drawButton("lod", col, btnRow, " L" .. state.lod); col = col + 3
-  local altLabel = state.altHoldActive and " ALT* " or " ALT "
-  drawButton("alt", col, btnRow, altLabel); col = col + #altLabel
-  if state.target then
+
+  -- Nav tabs (always shown)
+  for _, tab in ipairs(NAV_TABS) do
+    local active = state.screen == tab.screen
+    drawButton(tab.id, col, btnRow, tab.label, colors.black, active and colors.white or colors.lightGray)
+    col = col + #tab.label
+  end
+  col = col + 1
+
+  if state.screen == "map" then
+    drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
+    drawButton("zoom_out", col, btnRow, " - "); col = col + 3
+    drawButton("lod",      col, btnRow, " L" .. state.lod); col = col + 3
+    if state.target then
+      col = col + 1
+      local autoLabel = state.engaged and " STOP " or " AUTO "
+      local autoBg = state.engaged and colors.lime or colors.lightGray
+      drawButton("auto", col, btnRow, autoLabel, colors.black, autoBg); col = col + #autoLabel
+      drawButton("clear_target", col, btnRow, " X "); col = col + 3
+    end
+    if not IS_POCKET and state.autoStatus and state.autoStatus ~= "" then
+      local sfg, sbg = autoStatusColor(state.autoStatus)
+      local label = " " .. state.autoStatus .. " "
+      drawText(col + 1, btnRow, label, sfg, sbg)
+      col = col + 1 + #label
+    end
+    local headingStr = (state.shipHeading and tostring(math.floor((state.shipHeading or 0) + 0.5))) or "--"
+    local pCount = #(state.players or {})
+    local pInfo  = "P" .. pCount
+    if not IS_POCKET and state.lastFrame and state.lastPos and state.players[1] and state.players[1].position then
+      local pp = state.players[1]
+      local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapHeight())
+      pInfo = pInfo .. ":" .. pcol .. "," .. prow
+    end
+    local segs
+    if state.target then
+      local dx    = (state.target.x or 0) - (state.lastPos and state.lastPos.x or 0)
+      local dz    = (state.target.z or 0) - (state.lastPos and state.lastPos.z or 0)
+      local range = math.floor(math.sqrt(dx * dx + dz * dz))
+      local etaSeg = ""
+      if state.engaged and state.velocity and state.velocity > 0.5 and range > 5 then
+        etaSeg = " ETA:" .. fmtEta(range / state.velocity)
+      end
+      segs = {
+        { (state.target.name or "?"),          colors.yellow    },
+        { " " .. range .. "m",                 colors.lime      },
+        { etaSeg,                               colors.cyan      },
+        { string.format(" X%d Z%d", x, z),    colors.gray      },
+        { " H" .. headingStr,                  colors.lightBlue },
+      }
+    else
+      segs = {
+        { string.format("X%d Z%d", x, z),     colors.gray      },
+        { " H" .. headingStr,                  colors.lightBlue },
+        { " " .. pInfo,                        colors.lightGray },
+      }
+      if state.velocity    then segs[#segs+1] = { string.format(" S%.1f", state.velocity),              colors.white } end
+      if state.altitude    then segs[#segs+1] = { string.format(" A%d", math.floor(state.altitude+0.5)), colors.white } end
+      if state.burnerLevel then segs[#segs+1] = { " Bn" .. state.burnerLevel,                           colors.white } end
+      if isStale()         then segs[#segs+1] = { " STALE",                                             colors.red   } end
+    end
+    if IS_POCKET then
+      drawSegments(1, coordRow, segs)
+    else
+      local totalLen = 0
+      for _, s in ipairs(segs) do totalLen = totalLen + #tostring(s[1]) end
+      local startCol = math.max(col + 1, width - totalLen + 1)
+      drawSegments(startCol, coordRow, segs)
+    end
+
+  elseif state.screen == "waypoints" then
+    local total   = state.wpTotalItems or (#(state.players or {}) + #(state.waypoints or {}))
+    local canUp   = state.wpScroll > 0
+    local canDown = state.wpScroll + mapHeight() - 1 < total
+    drawButton("wp_scroll_up",   col, btnRow, " ^ ", colors.black, canUp   and colors.lightGray or colors.gray); col = col + 3
+    drawButton("wp_scroll_down", col, btnRow, " v ", colors.black, canDown and colors.lightGray or colors.gray); col = col + 3
+    if state.target then
+      col = col + 1
+      local autoLabel = state.engaged and " STOP " or " AUTO "
+      local autoBg    = state.engaged and colors.lime or colors.lightGray
+      drawButton("auto",         col, btnRow, autoLabel, colors.black, autoBg); col = col + #autoLabel
+      drawButton("clear_target", col, btnRow, " X "); col = col + 3
+    end
+    local info = #(state.waypoints or {}) .. "wp " .. #(state.players or {}) .. "p"
+    if width - #info + 1 > col then
+      drawText(width - #info + 1, btnRow, info, colors.lightGray, colors.black)
+    end
+
+  elseif state.screen == "controls" then
+    drawButton("burner_down", col, btnRow, " - "); col = col + 3
+    drawButton("burner_up",   col, btnRow, " + "); col = col + 3
+    local modeStr = state.engaged       and ("AUTO " .. (state.autoStatus or ""))
+                 or state.altHoldActive and "ALT HOLD"
+                 or "MANUAL"
+    if width - #modeStr + 1 > col then
+      drawText(width - #modeStr + 1, btnRow, modeStr, colors.white, colors.black)
+    end
+
+  elseif state.screen == "settings" then
+    drawButton("setting_prev", col, btnRow, " < "); col = col + 3
+    drawButton("setting_next", col, btnRow, " > "); col = col + 3
     col = col + 1
-    local autoLabel = state.engaged and " STOP " or " AUTO "
-    drawButton("auto", col, btnRow, autoLabel); col = col + #autoLabel
-    drawButton("clear_target", col, btnRow, " X "); col = col + 3
+    drawButton("setting_dec",  col, btnRow, " - "); col = col + 3
+    drawButton("setting_inc",  col, btnRow, " + "); col = col + 3
+    local s = SETTINGS[state.settingIdx]
+    if s then
+      local info = s.name .. ": " .. tostring(s.get())
+      if width - #info + 1 > col then
+        drawText(width - #info + 1, btnRow, info, colors.yellow, colors.black)
+      end
+    end
   end
-  local headingStr = (state.shipHeading and tostring(math.floor((state.shipHeading or 0) + 0.5))) or "--"
-  local pCount = #(state.players or {})
-  local pInfo = "P" .. pCount
-  if not IS_POCKET and state.lastFrame and state.lastPos and state.players[1] and state.players[1].position then
-    local pp = state.players[1]
-    local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapHeight())
-    pInfo = pInfo .. ":" .. pcol .. "," .. prow
-  end
-  local extras = ""
-  if state.velocity then extras = extras .. string.format(" S%.1f", state.velocity) end
-  if state.altitude then extras = extras .. string.format(" A%d", math.floor(state.altitude + 0.5)) end
-  if state.burnerLevel then extras = extras .. string.format(" Bn%d", state.burnerLevel) end
-  if isStale() then extras = extras .. " STALE" end
-  local coord
-  if state.target then
-    local dx = (state.target.x or 0) - (state.lastPos and state.lastPos.x or 0)
-    local dz = (state.target.z or 0) - (state.lastPos and state.lastPos.z or 0)
-    local range = math.floor(math.sqrt(dx * dx + dz * dz))
-    coord = string.format("%s %dm %s X%d Z%d H%s%s",
-      state.target.name or "?", range, state.autoStatus or "",
-      x, z, headingStr, extras)
-  else
-    coord = string.format("X%d Z%d H%s B%s %s%s",
-      x, z, headingStr, tostring(state.bpp), pInfo, extras)
-  end
-  if IS_POCKET then
-    drawText(1, coordRow, coord:sub(1, width), colors.white, colors.black)
-  else
-    local startCol = math.max(col + 1, width - #coord + 1)
-    drawText(startCol, coordRow, coord:sub(1, width - startCol + 1), colors.white, colors.black)
-  end
+
   if state.lastError then
     monitor.setCursorPos(1, 1)
     monitor.setTextColor(colors.red)
@@ -1275,7 +1653,7 @@ local function maybeFetchSidecar()
 end
 
 local function fullRedraw()
-  if not state.lastFrame or not state.lastPos then return end
+  if not state.lastPos then return end
   if state.target and state.target.kind == "player" then
     for _, pp in ipairs(state.players or {}) do
       if pp.name == state.target.name and pp.position then
@@ -1287,18 +1665,29 @@ local function fullRedraw()
   end
   local mapH = mapHeight()
   state.targetCells = {}
-  drawCachedMap(mapH)
-  -- Map underneath changed; force tape to repaint regardless of skip guard.
-  state.lastTapeAlt = nil
-  state.lastTapeGround = nil
-  state.lastBurnerLevel = nil
-  state.lastTapeCells = {}
-  overlayDotTrail(state.lastPos.x, state.lastPos.z, mapH)
-  overlayWaypoints(state.lastPos.x, state.lastPos.z, mapH)
-  overlayOtherPlayers(state.lastPos.x, state.lastPos.z, mapH)
-  overlayAltitudeTape(mapH)
-  if not IS_POCKET then overlaySpeedDial(mapH) end
-  overlaySelfTriangle(state.shipHeading, mapH)
+  if state.screen == "map" then
+    if state.lastFrame then
+      drawCachedMap(mapH)
+      state.lastTapeAlt = nil
+      state.lastTapeGround = nil
+      state.lastBurnerLevel = nil
+      state.lastTapeCells = {}
+      overlayDotTrail(state.lastPos.x, state.lastPos.z, mapH)
+      overlayWaypoints(state.lastPos.x, state.lastPos.z, mapH)
+      overlayOtherPlayers(state.lastPos.x, state.lastPos.z, mapH)
+      overlayPin(state.lastPos.x, state.lastPos.z, mapH)
+      overlayMarkerLabels(state.lastPos.x, state.lastPos.z, mapH)
+      overlayAltitudeTape(mapH)
+      if not IS_POCKET then overlaySpeedDial(mapH) end
+      overlaySelfTriangle(state.shipHeading, mapH)
+    end
+  elseif state.screen == "waypoints" then
+    drawWaypointsScreen(mapH)
+  elseif state.screen == "controls" then
+    drawControlsScreen(mapH)
+  elseif state.screen == "settings" then
+    drawSettingsScreen(mapH)
+  end
   drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y or 0), math.floor(state.lastPos.z))
 end
 
@@ -1344,11 +1733,15 @@ local function fastTick()
     updateBurnerLevel()
     autopilotTick()
   end
-  if state.lastFrame and state.lastPos then
+  if state.lastPos then
     local mapH = mapHeight()
-    overlayAltitudeTape(mapH)
-    if not IS_POCKET then overlaySpeedDial(mapH) end
-    overlaySelfTriangle(state.shipHeading, mapH)
+    if state.screen == "map" and state.lastFrame then
+      overlayAltitudeTape(mapH)
+      if not IS_POCKET then overlaySpeedDial(mapH) end
+      overlaySelfTriangle(state.shipHeading, mapH)
+    elseif state.screen == "controls" then
+      drawControlsScreen(mapH)
+    end
     drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y or 0), math.floor(state.lastPos.z))
   end
 end
@@ -1488,12 +1881,57 @@ local function applyCommand(cmd)
       state.burnerTarget = nil
     end
     resetLiftIntegrator()
+
+  elseif id == "screen_map"       then state.screen = "map";       fullRedraw()
+  elseif id == "screen_waypoints" then state.screen = "waypoints"; state.wpScroll = 0; fullRedraw()
+  elseif id == "screen_controls"  then state.screen = "controls";  fullRedraw()
+  elseif id == "screen_settings"  then state.screen = "settings";  fullRedraw()
+
+  elseif id == "wp_scroll_up" then
+    state.wpScroll = math.max(0, state.wpScroll - 1)
+  elseif id == "wp_scroll_down" then
+    local total = state.wpTotalItems or (#(state.players or {}) + #(state.waypoints or {}))
+    local maxScroll = math.max(0, total - (mapHeight() - 1))
+    state.wpScroll = math.min(maxScroll, state.wpScroll + 1)
+
+  elseif id == "platform_toggle" then
+    state.platformActive = not state.platformActive
+    setControl("platform", not state.platformActive)  -- LOW = lowering, HIGH = raised
+
+  elseif id == "burner_up" then
+    local lvl = math.min(15, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) + 1)
+    applyCommand({ cmd = "set_burner", level = lvl })
+  elseif id == "burner_down" then
+    local lvl = math.max(0, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) - 1)
+    applyCommand({ cmd = "set_burner", level = lvl })
+
+  elseif id == "setting_prev" then
+    state.settingIdx = math.max(1, state.settingIdx - 1)
+  elseif id == "setting_next" then
+    state.settingIdx = math.min(#SETTINGS, state.settingIdx + 1)
+  elseif id == "setting_inc" then
+    local s = SETTINGS[cmd.idx or state.settingIdx]
+    if s then s.set(math.min(s.max, s.get() + s.step)) end
+  elseif id == "setting_dec" then
+    local s = SETTINGS[cmd.idx or state.settingIdx]
+    if s then s.set(math.max(s.min, s.get() - s.step)) end
   end
 end
+
+-- Commands that only affect local UI state -- never forward to the ship.
+local LOCAL_CMDS = {
+  screen_map=true, screen_waypoints=true, screen_controls=true, screen_settings=true,
+  wp_scroll_up=true, wp_scroll_down=true,
+  setting_prev=true, setting_next=true,
+}
 
 -- Pocket forwards every command to the ship over rednet, signed with the
 -- shared secret. Ship applies locally.
 local function dispatchCommand(cmd)
+  if LOCAL_CMDS[cmd.cmd] then
+    applyCommand(cmd)
+    return
+  end
   if IS_POCKET then
     if state.shipId then
       cmd.secret = CONTROL_SECRET
@@ -1507,18 +1945,40 @@ end
 local function handleTouch(_, side, x, y)
   for id, btn in pairs(buttons) do
     if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
-      dispatchCommand({ cmd = id })
+      local c = { cmd = id }
+      if id == "setting_inc" or id == "setting_dec" then
+        c.idx = state.settingIdx
+      end
+      dispatchCommand(c)
       return
     end
   end
   for _, t in ipairs(state.targetCells or {}) do
     if y == t.row and x >= t.col1 and x <= t.col2 then
-      dispatchCommand({
-        cmd = "set_target",
-        target = { kind = t.kind, name = t.name, x = t.x, z = t.z, color = t.color },
-      })
+      if t.cmd then
+        dispatchCommand({ cmd = t.cmd })
+      else
+        dispatchCommand({
+          cmd = "set_target",
+          target = { kind = t.kind, name = t.name, x = t.x, z = t.z, color = t.color },
+        })
+      end
       return
     end
+  end
+  -- Map tap: place a pin at the tapped world location
+  if state.screen == "map" and state.lastPos and state.lastFrame and y <= mapHeight() then
+    local wx, wz = cellToWorld(x, y, state.lastPos.x, state.lastPos.z, mapHeight())
+    dispatchCommand({
+      cmd = "set_target",
+      target = {
+        kind  = "pin",
+        name  = "Pin",
+        x     = math.floor(wx + 0.5),
+        z     = math.floor(wz + 0.5),
+        color = "e",
+      },
+    })
   end
 end
 
@@ -1542,6 +2002,10 @@ local function stateSnapshot()
     autoStatus    = state.autoStatus,
     bpp           = state.bpp,
     lod           = state.lod,
+    cruiseAltAgl    = CRUISE_ALT_AGL,
+    minAltAgl       = MIN_ALT_AGL,
+    hoverBurner     = HOVER_BURNER,
+    platformActive  = state.platformActive,
   }
 end
 
@@ -1603,6 +2067,10 @@ local function rednetLoop()
           state.autoStatus    = msg.autoStatus or ""
           if msg.bpp then state.bpp = msg.bpp end
           if msg.lod then state.lod = msg.lod end
+          if msg.cruiseAltAgl   then CRUISE_ALT_AGL        = msg.cruiseAltAgl   end
+          if msg.minAltAgl      then MIN_ALT_AGL           = msg.minAltAgl      end
+          if msg.hoverBurner    then HOVER_BURNER          = msg.hoverBurner    end
+          if msg.platformActive ~= nil then state.platformActive = msg.platformActive end
           state.lastUpdateAt = os.clock()
         end
       end
