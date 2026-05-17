@@ -69,6 +69,10 @@ if readFile("minimap.lua") ~= minimapShim then
 end
 
 syncFile("cfgutil.lua", "cfgutil.lua")
+-- sha256.lua isn't strictly needed for v1 pocket auth (pocket sends
+-- plaintext) but minimap.lua dofile()s it unconditionally and it's tiny.
+-- Future v2 challenge-response will need it on the pocket anyway.
+syncFile("sha256.lua", "sha256.lua")
 local Cfg = dofile("cfgutil.lua")
 
 -- 3. Merge any new default config keys into minimap-pocket.cfg without overwriting.
