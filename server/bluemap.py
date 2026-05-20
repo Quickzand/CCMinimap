@@ -4,6 +4,7 @@ import io
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -25,6 +26,7 @@ class BlueMapConfig:
     map_id: str
     timeout_seconds: float = 10.0
     cache_dir: Path = Path("/tmp/bluemap-minimap-cache")
+    cache_ttl_seconds: float = 86400.0
 
     @classmethod
     def from_env(cls) -> "BlueMapConfig":
@@ -32,14 +34,18 @@ class BlueMapConfig:
         map_id = os.environ.get("BLUEMAP_MAP_ID", "world")
         timeout = float(os.environ.get("BLUEMAP_TIMEOUT_SECONDS", "10"))
         cache_dir = Path(os.environ.get("BLUEMAP_CACHE_DIR", "/tmp/bluemap-minimap-cache"))
+        cache_ttl = float(os.environ.get("BLUEMAP_CACHE_TTL_SECONDS", "86400"))
 
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("BLUEMAP_BASE_URL must be an http(s) origin")
         if not _MAP_ID_RE.fullmatch(map_id):
             raise ValueError("BLUEMAP_MAP_ID contains invalid characters")
+        if cache_ttl < 0:
+            raise ValueError("BLUEMAP_CACHE_TTL_SECONDS must be non-negative")
 
-        return cls(base_url=base_url, map_id=map_id, timeout_seconds=timeout, cache_dir=cache_dir)
+        return cls(base_url=base_url, map_id=map_id, timeout_seconds=timeout,
+                   cache_dir=cache_dir, cache_ttl_seconds=cache_ttl)
 
 
 def split_number_to_path(value: int) -> str:
@@ -104,25 +110,44 @@ class BlueMapClient:
             raise BlueMapError(f"LOD must be between 1 and {lowres.lod_count}")
 
         cache_path = self.tile_cache_path(lod, tile_x, tile_z)
-        if cache_path.exists():
-            return Image.open(cache_path).convert("RGBA")
+        cache_exists = cache_path.exists()
 
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        response = self.session.get(
-            self.tile_url(lod, tile_x, tile_z),
-            timeout=self.config.timeout_seconds,
-            headers={"accept": "image/png"},
-        )
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        if "image/png" not in content_type:
-            return None
+        # Fresh cache: serve directly without touching upstream.
+        if cache_exists:
+            age = time.time() - cache_path.stat().st_mtime
+            if age < self.config.cache_ttl_seconds:
+                return Image.open(cache_path).convert("RGBA")
+        else:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-        image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-        image.save(cache_path)
-        return image
+        # Stale or missing: try to refresh from upstream. On any failure
+        # (network error, 5xx, non-PNG response), fall back to the stale
+        # cached copy if we have one -- "last good state" is better than
+        # a hole in the frame while BlueMap is down or restarting.
+        try:
+            response = self.session.get(
+                self.tile_url(lod, tile_x, tile_z),
+                timeout=self.config.timeout_seconds,
+                headers={"accept": "image/png"},
+            )
+            if response.status_code == 404:
+                if cache_exists:
+                    return Image.open(cache_path).convert("RGBA")
+                return None
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "image/png" not in content_type:
+                if cache_exists:
+                    return Image.open(cache_path).convert("RGBA")
+                return None
+
+            image = Image.open(io.BytesIO(response.content)).convert("RGBA")
+            image.save(cache_path)
+            return image
+        except requests.RequestException:
+            if cache_exists:
+                return Image.open(cache_path).convert("RGBA")
+            raise
 
     def live_markers(self) -> dict:
         response = self.session.get(
