@@ -4,13 +4,14 @@ import io
 import math
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 
 class BlueMapError(RuntimeError):
@@ -104,6 +105,37 @@ class BlueMapClient:
         safe_name = f"lod{lod}_x{tile_x}_z{tile_z}.png".replace("-", "m")
         return self.config.cache_dir / self.config.map_id / safe_name
 
+    def _read_cached_tile(self, cache_path: Path) -> Image.Image | None:
+        """Open a cached tile, returning None if it's missing or corrupt.
+
+        PIL's image.save() is not atomic -- it truncates the destination then
+        writes. Under concurrent requests for the same tile (and any other
+        crash mid-write) a reader can hit a 0-byte or partial PNG file. Treat
+        that as a cache miss so the caller refetches instead of 500-ing.
+        """
+        try:
+            return Image.open(cache_path).convert("RGBA")
+        except (UnidentifiedImageError, OSError):
+            return None
+
+    def _save_tile_atomic(self, image: Image.Image, cache_path: Path) -> None:
+        """Write tile to a sibling tempfile, then os.replace. Prevents the
+        0-byte window concurrent writers would otherwise leave."""
+        fd, tmp_name = tempfile.mkstemp(
+            dir=cache_path.parent, prefix=cache_path.name + ".", suffix=".tmp",
+        )
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            image.save(tmp, format="PNG")
+            os.replace(tmp, cache_path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
     def fetch_lowres_tile(self, lod: int, tile_x: int, tile_z: int) -> Image.Image | None:
         lowres = self.lowres_settings()
         if lod < 1 or lod > lowres.lod_count:
@@ -112,11 +144,15 @@ class BlueMapClient:
         cache_path = self.tile_cache_path(lod, tile_x, tile_z)
         cache_exists = cache_path.exists()
 
-        # Fresh cache: serve directly without touching upstream.
+        # Fresh cache: serve directly without touching upstream. _read_cached_tile
+        # returns None on corruption so we fall through to a refetch instead of
+        # raising.
         if cache_exists:
             age = time.time() - cache_path.stat().st_mtime
             if age < self.config.cache_ttl_seconds:
-                return Image.open(cache_path).convert("RGBA")
+                cached = self._read_cached_tile(cache_path)
+                if cached is not None:
+                    return cached
         else:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -132,21 +168,21 @@ class BlueMapClient:
             )
             if response.status_code == 404:
                 if cache_exists:
-                    return Image.open(cache_path).convert("RGBA")
+                    return self._read_cached_tile(cache_path)
                 return None
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
             if "image/png" not in content_type:
                 if cache_exists:
-                    return Image.open(cache_path).convert("RGBA")
+                    return self._read_cached_tile(cache_path)
                 return None
 
             image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-            image.save(cache_path)
+            self._save_tile_atomic(image, cache_path)
             return image
         except requests.RequestException:
             if cache_exists:
-                return Image.open(cache_path).convert("RGBA")
+                return self._read_cached_tile(cache_path)
             raise
 
     def live_markers(self) -> dict:
