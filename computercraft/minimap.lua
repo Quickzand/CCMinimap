@@ -414,6 +414,9 @@ local state = {
   phase = nil,          -- nil | CLIMB_TO_CRUISE | CRUISE | LAND
   altHoldActive = false,
   altHoldTarget = nil,
+  aglHoldActive = false,
+  aglHoldOffset = nil,  -- locked AGL offset (m above current groundY)
+  altStep = 1,          -- step size for controls-screen +/- (cycles 1/5/10)
   burnerTarget = nil,   -- manual setpoint from CLI; controller ramps to it, then clears
   landRampStart = nil,      -- os.clock() when LAND phase began
   landRampStartLevel = nil, -- burner level snapshot at LAND entry
@@ -1236,8 +1239,8 @@ local function updatePhase()
   end
 
   if range < ARRIVAL_RADIUS then
-    if state.altHoldActive then
-      -- ALT was engaged in parallel; hand altitude off to it instead of landing.
+    if state.altHoldActive or state.aglHoldActive then
+      -- An altitude lock is on; hand altitude off to it instead of landing.
       state.engaged = false
       state.phase = nil
       setControl("forward", false); setControl("left", false); setControl("right", false)
@@ -1257,7 +1260,11 @@ local function updatePhase()
   end
 
   if state.phase == nil then
-    if agl and agl < CRUISE_ALT_AGL - CLIMB_DONE_MARGIN then
+    -- When an altitude lock is active the user has explicitly chosen the
+    -- altitude; skip CLIMB_TO_CRUISE so horizontal nav starts immediately.
+    if state.altHoldActive or state.aglHoldActive then
+      state.phase = "CRUISE"
+    elseif agl and agl < CRUISE_ALT_AGL - CLIMB_DONE_MARGIN then
       state.phase = "CLIMB_TO_CRUISE"
     else
       state.phase = "CRUISE"
@@ -1266,7 +1273,7 @@ local function updatePhase()
 end
 
 local function altitudeController()
-  if not state.engaged and not state.altHoldActive and not state.burnerTarget then
+  if not state.engaged and not state.altHoldActive and not state.aglHoldActive and not state.burnerTarget then
     -- Idle: hand the burner back to the manual +/- controller on the same
     -- signals. Drop any in-flight pulse and force the outputs LOW so we
     -- never fight a person holding the button.
@@ -1300,11 +1307,17 @@ local function altitudeController()
     local frac = math.min(1, t / math.max(0.001, LAND_RAMP_S))
     desired = math.floor(startLvl + (LAND_BURNER - startLvl) * frac + 0.5)
   else
+    -- Altitude target precedence: ALT lock and AGL lock are explicit user
+    -- intent and win over AUTO's default cruise-AGL. AUTO drives horizontal
+    -- only when a lock is active.
     local targetAlt
-    if state.engaged and state.groundY then
-      targetAlt = state.groundY + CRUISE_ALT_AGL
-    elseif state.altHoldActive then
+    if state.altHoldActive then
       targetAlt = state.altHoldTarget
+    elseif state.aglHoldActive then
+      if not state.groundY then return end
+      targetAlt = state.groundY + state.aglHoldOffset
+    elseif state.engaged and state.groundY then
+      targetAlt = state.groundY + CRUISE_ALT_AGL
     end
     if not targetAlt then return end
 
@@ -1511,6 +1524,23 @@ local function drawControlsScreen(mapH)
     monitor.setTextColor(fg); monitor.setBackgroundColor(bg)
     monitor.write(label:sub(1, width - 1))
     table.insert(state.targetCells, { col1 = 2, col2 = width, row = row, cmd = "alt" })
+    row = row + 1
+  end
+  -- AGL LOCK: tappable row, mirrors ALT LOCK
+  do
+    local active = state.aglHoldActive
+    local fg = active and colors.yellow or colors.white
+    local bg = active and colors.gray   or colors.black
+    local label
+    if active and state.aglHoldOffset then
+      label = string.format("AGL LOCK  [ ON @ %dm ]", math.floor(state.aglHoldOffset + 0.5))
+    else
+      label = "AGL LOCK  [  OFF  ]"
+    end
+    monitor.setCursorPos(2, row)
+    monitor.setTextColor(fg); monitor.setBackgroundColor(bg)
+    monitor.write(label:sub(1, width - 1))
+    table.insert(state.targetCells, { col1 = 2, col2 = width, row = row, cmd = "agl" })
     row = row + 1
   end
   if state.engaged and state.autoStatus ~= "" then
@@ -1742,11 +1772,23 @@ local function drawOsd(x, y, z)
     end
 
   elseif state.screen == "controls" then
+    local stepLabel = string.format("%2d ", state.altStep or 1)
+    drawButton("step_cycle",  col, btnRow, stepLabel); col = col + 3
     drawButton("burner_down", col, btnRow, " - "); col = col + 3
     drawButton("burner_up",   col, btnRow, " + "); col = col + 3
-    local modeStr = state.engaged       and ("AUTO " .. (state.autoStatus or ""))
-                 or state.altHoldActive and "ALT HOLD"
-                 or "MANUAL"
+    -- Mode label follows the "lock + target" precedent (e.g. ALT HOLD @ 120m).
+    -- AUTO is orthogonal to ALT/AGL lock: when both are active, both appear.
+    local parts = {}
+    if state.altHoldActive and state.altHoldTarget then
+      parts[#parts+1] = string.format("ALT HOLD @ %dm", math.floor(state.altHoldTarget + 0.5))
+    elseif state.aglHoldActive and state.aglHoldOffset then
+      parts[#parts+1] = string.format("AGL HOLD @ %dm", math.floor(state.aglHoldOffset + 0.5))
+    end
+    if state.engaged then
+      parts[#parts+1] = "AUTO " .. (state.autoStatus or "")
+    end
+    if #parts == 0 then parts[1] = "MANUAL" end
+    local modeStr = table.concat(parts, "  ")
     if width - #modeStr + 1 > col then
       drawText(width - #modeStr + 1, btnRow, modeStr, colors.white, colors.black)
     end
@@ -1933,8 +1975,28 @@ local function applyCommand(cmd)
     else
       state.altHoldActive = true
       state.altHoldTarget = state.altitude
+      -- ALT and AGL are mutually exclusive; the last press wins.
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
     end
     resetLiftIntegrator()
+  elseif id == "agl" then
+    -- Toggle AGL lock at current AGL. Requires groundY to compute the offset;
+    -- silently bail if unknown so the user can retry once BlueMap responds.
+    if state.aglHoldActive then
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
+    elseif state.altitude and state.groundY then
+      state.aglHoldActive = true
+      state.aglHoldOffset = math.max(0, state.altitude - state.groundY)
+      state.altHoldActive = false
+      state.altHoldTarget = nil
+    end
+    resetLiftIntegrator()
+  elseif id == "step_cycle" then
+    -- Cycle the +/- step on the controls screen: 1 -> 5 -> 10 -> 1.
+    local cur = state.altStep or 1
+    state.altStep = (cur == 1 and 5) or (cur == 5 and 10) or 1
   elseif id == "clear_target" then
     state.target = nil
     state.engaged = false
@@ -1962,8 +2024,8 @@ local function applyCommand(cmd)
     state.target = { kind = "cli", name = "GOTO", x = cmd.x, z = cmd.z, color = "1" }
     state.engaged = true
     state.phase = nil
-    state.altHoldActive = false
-    state.altHoldTarget = nil
+    -- ALT/AGL lock is preserved across goto; AUTO drives horizontal only when
+    -- a lock is active. burnerTarget is cleared because manual burner conflicts.
     state.burnerTarget = nil
     state.autoStatus = ""
     resetLiftIntegrator()
@@ -1978,8 +2040,6 @@ local function applyCommand(cmd)
         }
         state.engaged = true
         state.phase = nil
-        state.altHoldActive = false
-        state.altHoldTarget = nil
         state.burnerTarget = nil
         state.autoStatus = ""
         resetLiftIntegrator()
@@ -1995,6 +2055,8 @@ local function applyCommand(cmd)
       state.phase = nil
       state.altHoldActive = false
       state.altHoldTarget = nil
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
       state.burnerTarget = lvl
       state.autoStatus = ""
       resetLiftIntegrator()
@@ -2007,6 +2069,8 @@ local function applyCommand(cmd)
     state.phase = nil
     state.altHoldActive = false
     state.altHoldTarget = nil
+    state.aglHoldActive = false
+    state.aglHoldOffset = nil
     state.burnerTarget = nil
     state.autoStatus = ""
     resetLiftIntegrator()
@@ -2016,16 +2080,39 @@ local function applyCommand(cmd)
     if type(cmd.altitude) == "number" then
       state.altHoldActive = true
       state.altHoldTarget = cmd.altitude
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
       state.burnerTarget = nil
-      state.engaged = false
-      state.phase = nil
-      setControl("forward", false); setControl("left", false); setControl("right", false)
     elseif state.altHoldActive then
       state.altHoldActive = false
       state.altHoldTarget = nil
     else
       state.altHoldActive = true
       state.altHoldTarget = state.altitude
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
+      state.burnerTarget = nil
+    end
+    resetLiftIntegrator()
+  elseif id == "agl_set" then
+    -- CLI: `minimap agl [N]`. No arg = toggle at current AGL. With arg = lock
+    -- at N m above current ground. Requires groundY when engaging.
+    if type(cmd.offset) == "number" then
+      if state.groundY then
+        state.aglHoldActive = true
+        state.aglHoldOffset = math.max(0, cmd.offset)
+        state.altHoldActive = false
+        state.altHoldTarget = nil
+        state.burnerTarget = nil
+      end
+    elseif state.aglHoldActive then
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
+    elseif state.altitude and state.groundY then
+      state.aglHoldActive = true
+      state.aglHoldOffset = math.max(0, state.altitude - state.groundY)
+      state.altHoldActive = false
+      state.altHoldTarget = nil
       state.burnerTarget = nil
     end
     resetLiftIntegrator()
@@ -2059,11 +2146,31 @@ local function applyCommand(cmd)
     setControl(name, ctl.inverted and (not active) or active)
 
   elseif id == "burner_up" then
-    local lvl = math.min(15, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) + 1)
-    applyCommand({ cmd = "set_burner", level = lvl })
+    -- Context-sensitive: bump whichever altitude target is locked, else burner.
+    -- Step is the controls-screen step button (1/5/10).
+    local step = state.altStep or 1
+    if state.altHoldActive and state.altHoldTarget then
+      state.altHoldTarget = state.altHoldTarget + step
+      resetLiftIntegrator()
+    elseif state.aglHoldActive and state.aglHoldOffset then
+      state.aglHoldOffset = state.aglHoldOffset + step
+      resetLiftIntegrator()
+    else
+      local lvl = math.min(15, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) + step)
+      applyCommand({ cmd = "set_burner", level = lvl })
+    end
   elseif id == "burner_down" then
-    local lvl = math.max(0, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) - 1)
-    applyCommand({ cmd = "set_burner", level = lvl })
+    local step = state.altStep or 1
+    if state.altHoldActive and state.altHoldTarget then
+      state.altHoldTarget = state.altHoldTarget - step
+      resetLiftIntegrator()
+    elseif state.aglHoldActive and state.aglHoldOffset then
+      state.aglHoldOffset = math.max(0, state.aglHoldOffset - step)
+      resetLiftIntegrator()
+    else
+      local lvl = math.max(0, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) - step)
+      applyCommand({ cmd = "set_burner", level = lvl })
+    end
 
   elseif id == "setting_prev" then
     state.settingIdx = math.max(1, state.settingIdx - 1)
@@ -2167,6 +2274,9 @@ local function stateSnapshot()
     engaged       = state.engaged,
     altHoldActive = state.altHoldActive,
     altHoldTarget = state.altHoldTarget,
+    aglHoldActive = state.aglHoldActive,
+    aglHoldOffset = state.aglHoldOffset,
+    altStep       = state.altStep,
     burnerTarget  = state.burnerTarget,
     phase         = state.phase,
     autoStatus    = state.autoStatus,
@@ -2236,6 +2346,9 @@ local function rednetLoop()
           state.engaged       = msg.engaged
           state.altHoldActive = msg.altHoldActive
           state.altHoldTarget = msg.altHoldTarget
+          state.aglHoldActive = msg.aglHoldActive
+          state.aglHoldOffset = msg.aglHoldOffset
+          if msg.altStep then state.altStep = msg.altStep end
           state.burnerTarget  = msg.burnerTarget
           state.phase         = msg.phase
           state.autoStatus    = msg.autoStatus or ""

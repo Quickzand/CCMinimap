@@ -100,7 +100,7 @@ end
 
 -- 4. Shell autocomplete for `minimap <subcommand> [args]` (the pocket has the
 -- minimap.lua shim that forwards to ship.lua; we register against its path).
-local SUBCOMMANDS = {"goto", "burner", "stop", "hold", "status", "wp", "password", "help", "--help"}
+local SUBCOMMANDS = {"goto", "burner", "stop", "hold", "agl", "status", "wp", "password", "help", "--help"}
 
 local function suffixesFromPrefix(list, prefix)
   local out = {}

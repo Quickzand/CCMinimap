@@ -103,15 +103,21 @@ local function printStatus(s)
   print(string.format("X %s  Z %s  H %s  Alt %s  Burner %s",
     fmtCoord(lp.x), fmtCoord(lp.z), fmtCoord(s.shipHeading),
     fmtCoord(s.altitude), tostring(s.burnerLevel or "?")))
-  local mode = "idle"
-  if s.engaged then
-    mode = "AUTO " .. (s.phase or "")
-  elseif s.altHoldActive then
-    mode = "HOLD " .. (s.altHoldTarget and fmtCoord(s.altHoldTarget) or "")
-  elseif s.burnerTarget then
-    mode = "BURNER->" .. tostring(s.burnerTarget)
+  -- AUTO is orthogonal to ALT/AGL lock; show both when both are active.
+  local parts = {}
+  if s.altHoldActive then
+    parts[#parts+1] = "HOLD " .. (s.altHoldTarget and fmtCoord(s.altHoldTarget) or "")
+  elseif s.aglHoldActive then
+    parts[#parts+1] = "AGL " .. (s.aglHoldOffset and fmtCoord(s.aglHoldOffset) or "") .. "m"
   end
-  print("Mode: " .. mode)
+  if s.engaged then
+    parts[#parts+1] = "AUTO " .. (s.phase or "")
+  end
+  if s.burnerTarget and #parts == 0 then
+    parts[#parts+1] = "BURNER->" .. tostring(s.burnerTarget)
+  end
+  if #parts == 0 then parts[1] = "idle" end
+  print("Mode: " .. table.concat(parts, " + "))
   if s.target then
     print(string.format("Target: %s X%d Z%d",
       tostring(s.target.name or "?"),
@@ -146,6 +152,12 @@ commands["hold"] = function(args)
   local alt = tonumber(args[1])
   send({cmd = "hold", altitude = alt})
   print(alt and ("hold at " .. math.floor(alt + 0.5)) or "hold toggle")
+end
+
+commands["agl"] = function(args)
+  local offset = tonumber(args[1])
+  send({cmd = "agl_set", offset = offset})
+  print(offset and ("agl at " .. math.floor(offset + 0.5) .. "m") or "agl toggle")
 end
 
 commands["wp"] = function(args)
@@ -235,6 +247,7 @@ commands["help"] = function()
   print("  minimap burner N         drive burner to level N (0-15)")
   print("  minimap stop             disengage everything")
   print("  minimap hold [alt]       toggle altitude hold (optional alt)")
+  print("  minimap agl [offset]     toggle AGL hold (optional offset m above ground)")
   print("  minimap wp <name>        autopilot to a named waypoint")
   print("  minimap status           position / heading / mode")
   print("  minimap password [<p>]   set/clear control password (per device)")

@@ -26,8 +26,10 @@ and CC:Tweaked.
 |---|---|
 | `+` / `-` | Zoom in/out |
 | `L1`/`L2`/`L3` | Cycle BlueMap LOD |
-| `ALT` | Toggle altitude hold |
-| `AUTO` | Engage autopilot (needs a target) |
+| `ALT LOCK` | Toggle altitude (Y) hold at current altitude |
+| `AGL LOCK` | Toggle altitude-above-ground hold at current AGL |
+| `1`/`5`/`10` | Controls-screen step. When ALT/AGL lock is on, `+`/`-` bump the locked target by this step; otherwise they bump burner |
+| `AUTO` | Engage autopilot (needs a target). Orthogonal to ALT/AGL lock — they drive altitude while AUTO drives horizontal |
 | `X` | Clear target |
 
 Tap a waypoint dot or another player to set them as the target.
@@ -42,8 +44,9 @@ shared `controlSecret`. Type `minimap` followed by a subcommand:
 | `minimap goto X Z` | Autopilot to coordinate X,Z |
 | `minimap wp <name>` | Autopilot to a named waypoint (tab-completes) |
 | `minimap burner N` | Drive burner to level N (0-15) |
-| `minimap hold [alt]` | Toggle altitude hold (optional explicit altitude) |
-| `minimap stop` | Disengage autopilot, altitude hold, and manual burner |
+| `minimap hold [alt]` | Toggle altitude (Y) hold (optional explicit altitude) |
+| `minimap agl [offset]` | Toggle AGL hold (optional explicit offset above ground) |
+| `minimap stop` | Disengage autopilot, altitude/AGL hold, and manual burner |
 | `minimap status` | Print position / heading / mode |
 | `minimap --help` | Full list |
 
