@@ -2091,6 +2091,15 @@ local function mapTick()
     if state.hasMap then fullRedraw() end
   end
 
+  -- Zoom debounce: rapid scroll-wheel zoom would wipe the grid and start a
+  -- fresh 9-tile fetch every step, hammering the server with throwaway
+  -- renders. After a zoom we hold off on the 8 neighbour fetches for ~1s;
+  -- subsequent zooms reset the timer. The centre tile still loads eagerly so
+  -- the user sees their current zoom level immediately.
+  if state.zoomSettledAt and os.clock() < state.zoomSettledAt then
+    return
+  end
+
   local neighborBatches = {
     {{-1, 0}, {1, 0}},
     {{0, -1}, {0, 1}},
@@ -2198,16 +2207,19 @@ local function applyCommand(cmd)
     state.bpp = clamp(state.bpp / 2, 0.25, 128)
     state.lod = pickLod(state.bpp)
     state.tiles = {}; state.hasMap = false  -- bpp change re-maps tile coords
+    state.zoomSettledAt = os.clock() + 1.0  -- defer neighbour fetches to coalesce rapid scroll
     os.queueEvent("map_dirty")
   elseif id == "zoom_out" then
     state.bpp = clamp(state.bpp * 2, 0.25, 128)
     state.lod = pickLod(state.bpp)
     state.tiles = {}; state.hasMap = false
+    state.zoomSettledAt = os.clock() + 1.0
     os.queueEvent("map_dirty")
   elseif id == "lod" then
     state.lod = state.lod + 1
     if state.lod > 3 then state.lod = 1 end
     state.tiles = {}; state.hasMap = false
+    state.zoomSettledAt = os.clock() + 1.0
     os.queueEvent("map_dirty")
   elseif id == "auto" then
     if state.target then
