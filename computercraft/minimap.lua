@@ -932,95 +932,98 @@ local HEX_TO_COLOR = {
 local overlayOtherPlayers, overlayOtherShips, overlayWaypoints
 do
 
--- Rasterize a small heading-oriented filled triangle ("chevron") at (col, row),
--- pointing in headingDeg (compass: 0=N, 90=E). Tip 3 sub-pixels ahead of
--- center, base 2 behind, half-width 1.5. Like overlaySelfTriangle but tiny,
--- and using overlayCell(override=true) so the terrain bg under each cell is
--- preserved -- only the lit sub-pixels recolour to `color`. Footprint is ~2x2
--- cells for cardinals, occasionally spilling to 3x2 for diagonals. Returns
--- the bounding box {col1,col2,row1,row2} so callers can register an
--- appropriately-sized tap target (nil if nothing painted, e.g. fully clipped).
-local overlayMarkerDisc   -- forward decl: chevron falls back to disc when
+-- Shared sub-pixel rasterizer: lights one sub-pixel (sxR, syR) in the per-cell
+-- bitmap `map`. Returns nothing -- callers blit `map` afterwards with
+-- overlayCell(override=true) so the terrain bg shows through.
+local function lightSubPx(map, sxR, syR)
+  local cc = math.floor(sxR / SUB_W) + 1
+  local rr = math.floor(syR / SUB_H) + 1
+  local sx = sxR - (cc - 1) * SUB_W
+  local sy = syR - (rr - 1) * SUB_H
+  if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
+    local key = cc * 1024 + rr
+    map[key] = bit32.bor(map[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
+  end
+end
+
+-- Small heading-oriented needle for peers (other players and ships). Mirrors
+-- the self-needle but shorter (3 sub-pixels vs 5) and with a single-sub-pixel
+-- base nub instead of a 3-sub-pixel cross, so peers stay visually distinct
+-- from the self marker. Needle paints in the peer's hash color; base nub
+-- paints in black. Returns a bbox for hitbox registration.
+local overlayMarkerDisc   -- forward decl: the needle falls back to disc when
                           -- headingDeg is nil (headingless beacons).
-local function overlayMarkerChevron(col, row, headingDeg, color, mapH)
+local function overlayMarkerNeedle(col, row, headingDeg, color, mapH)
   if headingDeg == nil then return overlayMarkerDisc(col, row, color, mapH) end
   local rad = math.rad(headingDeg)
   local dx = math.sin(rad)
   local dy = -math.cos(rad)
-  local px, py = -dy, dx       -- perpendicular, CCW 90deg
-
   local cSubX = (col - 1) * SUB_W + (SUB_W - 1) / 2
   local cSubY = (row - 1) * SUB_H + (SUB_H - 1) / 2
-  local lenAhead, lenBehind, baseHalfW = 3, 2, 1.5
 
-  local cells = {}
-  local function lightSub(sxR, syR)
-    local cc = math.floor(sxR / SUB_W) + 1
-    local rr = math.floor(syR / SUB_H) + 1
-    local sx = sxR - (cc - 1) * SUB_W
-    local sy = syR - (rr - 1) * SUB_H
-    if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
-      local key = cc * 1024 + rr
-      cells[key] = bit32.bor(cells[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
-    end
+  local NEEDLE_LEN_SUB = 3
+  local needle, base = {}, {}
+  -- Walk the needle from center outward.
+  local steps = NEEDLE_LEN_SUB * 4
+  for i = 0, steps do
+    local t = i / steps
+    lightSubPx(needle,
+      math.floor(cSubX + dx * NEEDLE_LEN_SUB * t + 0.5),
+      math.floor(cSubY + dy * NEEDLE_LEN_SUB * t + 0.5))
   end
+  -- Single sub-pixel base nub one step behind center.
+  lightSubPx(base,
+    math.floor(cSubX - dx + 0.5),
+    math.floor(cSubY - dy + 0.5))
 
-  local axisLen = lenAhead + lenBehind
-  local axisSteps = axisLen * 2
-  for i = 0, axisSteps do
-    local t = i / axisSteps  -- 0 at base, 1 at tip
-    local axisOff = -lenBehind + axisLen * t
-    local axCx = cSubX + dx * axisOff
-    local axCy = cSubY + dy * axisOff
-    local half = baseHalfW * (1 - t)
-    local perpSteps = math.max(1, math.ceil(half * 2))
-    for j = 0, perpSteps do
-      local s = -half + (2 * half) * (j / perpSteps)
-      local sxR = math.floor(axCx + px * s + 0.5)
-      local syR = math.floor(axCy + py * s + 0.5)
-      lightSub(sxR, syR)
-    end
-  end
-
+  -- Blit. Where the needle and base land in the same cell on the same sub-pixel,
+  -- the needle wins (same precedence as overlaySelfTriangle uses for its anchor).
   local minC, maxC, minR, maxR = math.huge, -math.huge, math.huge, -math.huge
-  for key, bits in pairs(cells) do
-    local cc = math.floor(key / 1024)
-    local rr = key - cc * 1024
-    overlayCell(cc, rr, bits, color, mapH, true)
+  local function trackBbox(cc, rr)
     if cc < minC then minC = cc end
     if cc > maxC then maxC = cc end
     if rr < minR then minR = rr end
     if rr > maxR then maxR = rr end
   end
+  for key, bits in pairs(needle) do
+    local cc = math.floor(key / 1024)
+    local rr = key - cc * 1024
+    overlayCell(cc, rr, bits, color, mapH, true)
+    base[key] = bit32.band(base[key] or 0, bit32.bnot(bits))
+    trackBbox(cc, rr)
+  end
+  for key, bits in pairs(base) do
+    if bits ~= 0 then
+      local cc = math.floor(key / 1024)
+      local rr = key - cc * 1024
+      overlayCell(cc, rr, bits, "f", mapH, true)   -- black base nub
+      trackBbox(cc, rr)
+    end
+  end
   if minC == math.huge then return nil end
   return { col1 = minC, col2 = maxC, row1 = minR, row2 = maxR }
 end
 
--- Filled disc rasterizer for static markers (waypoints) and headingless
--- beacons. rSub=1.5 gives a ~3x3 sub-pixel footprint, fitting ~2x2 cells.
-overlayMarkerDisc = function(col, row, color, mapH, rSub)
-  rSub = rSub or 1.5
+-- Small hollow ring for static markers (waypoints) and headingless beacons.
+-- 8 sub-pixels around the marker cell's center, hollow middle, terrain bg
+-- preserved per cell -- reads as a tiny "o" rather than a filled block. Cell
+-- footprint is at most 2x2 cells depending on alignment.
+overlayMarkerDisc = function(col, row, color, mapH)
   local cSubX = (col - 1) * SUB_W + (SUB_W - 1) / 2
   local cSubY = (row - 1) * SUB_H + (SUB_H - 1) / 2
   local cells = {}
-  local function lightSub(sxR, syR)
-    local cc = math.floor(sxR / SUB_W) + 1
-    local rr = math.floor(syR / SUB_H) + 1
-    local sx = sxR - (cc - 1) * SUB_W
-    local sy = syR - (rr - 1) * SUB_H
-    if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
-      local key = cc * 1024 + rr
-      cells[key] = bit32.bor(cells[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
-    end
-  end
-  local rmax = math.ceil(rSub)
-  local r2 = rSub * rSub
-  for dy = -rmax, rmax do
-    for dx = -rmax, rmax do
-      if dx * dx + dy * dy <= r2 then
-        lightSub(math.floor(cSubX + dx + 0.5), math.floor(cSubY + dy + 0.5))
-      end
-    end
+  -- 8 ring sub-pixels around (cSubX, cSubY), hollow center. Cell aspect (2x3
+  -- sub-pixels) makes a "geometric" circle look wide, so this is a hand-tuned
+  -- pattern that reads circular on the actual monitor.
+  local offsets = {
+                     {-1, -1}, {0, -1}, {1, -1},
+                     {-1,  0},          {1,  0},
+                     {-1,  1}, {0,  1}, {1,  1},
+  }
+  for _, off in ipairs(offsets) do
+    lightSubPx(cells,
+      math.floor(cSubX + off[1] + 0.5),
+      math.floor(cSubY + off[2] + 0.5))
   end
   local minC, maxC, minR, maxR = math.huge, -math.huge, math.huge, -math.huge
   for key, bits in pairs(cells) do
@@ -1060,7 +1063,7 @@ overlayOtherPlayers = function(cx, cz, mapH, restampOnly)
       if type(p.rotation) == "table" and type(p.rotation.yaw) == "number" then
         heading = compassFromMcYaw(p.rotation.yaw)
       end
-      local bbox = overlayMarkerChevron(col, row, heading, color, mapH)
+      local bbox = overlayMarkerNeedle(col, row, heading, color, mapH)
       if not restampOnly then
         registerHitbox(bbox, "player", p.name, p.position.x, p.position.z, color)
       end
@@ -1075,7 +1078,7 @@ overlayOtherShips = function(cx, cz, mapH, restampOnly)
     if peer.x and peer.z then
       local col, row = worldToCell(peer.x, peer.z, cx, cz, mapH)
       local color = colorForPlayer(name)
-      local bbox = overlayMarkerChevron(col, row, peer.heading, color, mapH)
+      local bbox = overlayMarkerNeedle(col, row, peer.heading, color, mapH)
       if not restampOnly then
         registerHitbox(bbox, "ship", name, peer.x, peer.z, color)
       end
