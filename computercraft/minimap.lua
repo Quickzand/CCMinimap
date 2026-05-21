@@ -1155,7 +1155,6 @@ local TAPE_ABOVE  = "7"   -- dark gray (above ship altitude)
 local TAPE_MID    = "8"   -- light gray (between ship and ground)
 local TAPE_BELOW  = "e"   -- red/brick (below ground)
 local TAPE_CURSOR = "f"   -- black (ship + ground tick)
-local TAPE_LABEL_FG = "f" -- black numeric label text
 
 -- Burner marker: 3 cells of yellow bg at the ship cursor row of the alt tape,
 -- with the burner level (0-15) rendered as a centered 2-digit decimal.
@@ -1173,13 +1172,20 @@ local function blitTapeCell(col, row, pattern, fg, bg)
   monitor.blit(string.char(emit + 0x80), f, b)
 end
 
-local function drawTapeLabel(text, row, anchorCol, bg, fg)
+-- Numeric labels next to the tape blend into the terrain like the on-map
+-- player/waypoint labels: per-cell bg sampled from getCell, fg auto-picked
+-- black or white against the bg's luminance for legibility.
+local function drawTapeLabel(text, row, anchorCol, mapH)
   local startCol = anchorCol - #text + 1
+  local mcx, mcz = mapCenter()
   for i = 1, #text do
     local c = startCol + i - 1
     if c >= 1 and c <= width then
+      local _, _, bg = getCell(c, row, mapH, mcx, mcz)
+      local bgChar = bg or "f"
+      local fgChar = BG_IS_LIGHT[bgChar] and "f" or "0"
       monitor.setCursorPos(c, row)
-      monitor.blit(text:sub(i, i), fg, bg)
+      monitor.blit(text:sub(i, i), fgChar, bgChar)
       state.lastTapeCells[c * 1024 + row] = true
     end
   end
@@ -1283,11 +1289,11 @@ overlayAltitudeTape = function(mapH)
   local function labelRow(subY)
     return topRow + math.floor(subY / SUB_H)
   end
-  drawTapeLabel(tostring(math.floor(state.altitude + 0.5)), altRow, labelAnchor, TAPE_MID, TAPE_LABEL_FG)
+  drawTapeLabel(tostring(math.floor(state.altitude + 0.5)), altRow, labelAnchor, mapH)
   if groundSubY and state.groundY then
     local groundRow = labelRow(groundSubY)
     if groundRow ~= altRow then
-      drawTapeLabel(tostring(state.groundY), groundRow, labelAnchor, TAPE_MID, TAPE_LABEL_FG)
+      drawTapeLabel(tostring(state.groundY), groundRow, labelAnchor, mapH)
     end
   end
 
