@@ -385,21 +385,6 @@ local function cancelSettings()
   end
 end
 
--- Bitmap font for callsigns drawn next to player markers. PixelPlace is 4x6
--- sub-pixels per glyph -- 2 cells tall, narrow enough that a 4-char callsign
--- still fits in roughly 9 cells of width.  Load is intentionally unguarded so
--- a missing/broken font surfaces as a real error instead of a silent
--- fall-back.  morefonts internally calls require() at module load (for
--- cc.expect), and CC:Tweaked's dofile() does not inherit require into the
--- loaded chunk's _ENV, so it has to come in via require, not dofile, even
--- though our other modules use dofile.
-local mf = require("morefonts")
-local callsignFont = mf.loadFont("fonts/PixelPlace")
-
-local function callsign(name)
-  return (name or "?"):sub(1, 4):upper()
-end
-
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
 local PLAYER_MARKER = { 0x2E, 0x1D }
 
@@ -950,23 +935,20 @@ local function overlayWaypoints(cx, cz, mapH)
 end
 
 local function overlayMarkerLabels(cx, cz, mapH)
-  -- Draw a 3-char callsign next to every visible player marker.  No fallback:
-  -- if mf fails the error bubbles up to fastTick's pcall and surfaces in red
-  -- on the OSD.
+  -- Draw name next to every visible player marker
   for _, p in ipairs(state.players or {}) do
     if p.name ~= PLAYER_NAME and p.position then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
       if row >= 1 and row <= mapH then
-        local tag = callsign(p.name)
-        local subW = mf.calculateTextSize(tag, { font = callsignFont, condense = true })
-        local cellW = math.max(1, math.ceil(subW / 2))
+        local name = p.name:sub(1, 9)
         local lx = col + 2
-        if lx + cellW - 1 > width then lx = math.max(1, col - cellW - 1) end
+        if lx + #name - 1 > width then lx = math.max(1, col - #name - 1) end
         if lx >= 1 then
           local hexColor = colorForPlayer(p.uuid or p.name or "?")
+          monitor.setCursorPos(lx, row)
           monitor.setTextColor(HEX_TO_COLOR[hexColor] or colors.cyan)
           monitor.setBackgroundColor(colors.black)
-          mf.writeOn(monitor, tag, lx, row, { font = callsignFont, condense = true })
+          monitor.write(name:sub(1, math.max(0, width - lx + 1)))
         end
       end
     end
