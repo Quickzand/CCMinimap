@@ -2113,33 +2113,41 @@ local function mapTick()
   -- renders. After a zoom we hold off on the 8 neighbour fetches for ~1s;
   -- subsequent zooms reset the timer. The centre tile still loads eagerly so
   -- the user sees their current zoom level immediately.
-  if state.zoomSettledAt and os.clock() < state.zoomSettledAt then
-    return
-  end
+  local zoomSettling = state.zoomSettledAt and os.clock() < state.zoomSettledAt
 
-  local neighborBatches = {
-    {{-1, 0}, {1, 0}},
-    {{0, -1}, {0, 1}},
-    {{-1, -1}, {1, 1}},
-    {{1, -1}, {-1, 1}},
-  }
-  for _, batch in ipairs(neighborBatches) do
-    local fetchers = {}
-    for _, off in ipairs(batch) do
-      local ti, tj = ci + off[1], cj + off[2]
-      if not state.tiles[tileKey(ti, tj)] then
-        local cti, ctj = ti, tj
-        table.insert(fetchers, function() fetchTile(cti, ctj, fetchBpp, fetchLod, mapH) end)
+  if not zoomSettling then
+    local neighborBatches = {
+      {{-1, 0}, {1, 0}},
+      {{0, -1}, {0, 1}},
+      {{-1, -1}, {1, 1}},
+      {{1, -1}, {-1, 1}},
+    }
+    for _, batch in ipairs(neighborBatches) do
+      local fetchers = {}
+      for _, off in ipairs(batch) do
+        local ti, tj = ci + off[1], cj + off[2]
+        if not state.tiles[tileKey(ti, tj)] then
+          local cti, ctj = ti, tj
+          table.insert(fetchers, function() fetchTile(cti, ctj, fetchBpp, fetchLod, mapH) end)
+        end
       end
-    end
-    if #fetchers > 0 then
-      parallel.waitForAll(table.unpack(fetchers))
-      if state.hasMap then fullRedraw() end
+      if #fetchers > 0 then
+        parallel.waitForAll(table.unpack(fetchers))
+        if state.hasMap then fullRedraw() end
+      end
     end
   end
 
   if state.hasMap then
     state.status = "ok"
+    -- Final redraw every tick so state changes that don't touch tiles (pin
+    -- placed, target changed, ship moved within current tile, etc.) repaint
+    -- their overlays. Pre-PR mapTick always called fullRedraw at the end;
+    -- the new fetch-driven redraws above only fire when tiles arrived, so
+    -- without this final redraw a steady-state mapTick becomes a no-op and
+    -- the pin marker (only drawn in fullRedraw, not fastTick) lags by up to
+    -- FRAME_INTERVAL.
+    fullRedraw()
   else
     drawError(state.lastError or "Loading map...")
   end
