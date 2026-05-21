@@ -20,7 +20,7 @@ local SERVER = "__SERVER_URL__"
 local PLAYER_NAME = "__PLAYER_NAME__"
 local NAV_PERIPHERAL = nil
 local NAV_METHOD = nil
-local FRAME_INTERVAL = 1.0
+local FRAME_INTERVAL = 0.5
 local NAV_INTERVAL = 0.1
 local SIDECAR_INTERVAL = 2.5
 
@@ -85,6 +85,18 @@ if not fs.exists(CONFIG_FILE) then
       "side": "back"
     }
   },
+  "customControls": [
+    {
+      "name": "Platform",
+      "relay": "redstone_relay_6",
+      "side": "back",
+      "mode": "toggle",
+      "inverted": true,
+      "activeLabel": "LOWERING",
+      "inactiveLabel": "RAISED",
+      "activeColor": "orange"
+    }
+  ],
   "liftMode": "burner",
   "useAltimeter": true,
   "useVelocitySensor": true,
@@ -106,7 +118,9 @@ if not fs.exists(CONFIG_FILE) then
   "landRampSeconds": 2.0,
   "playerName": "",
   "airshipName": "main",
-  "controlSecret": "changeme"
+  "controlSecret": "",
+  "controlSecretHash": "",
+  "authVersion": 1
 }
 ]])
   f.close()
@@ -127,11 +141,42 @@ if type(cfg.playerName) == "string" and cfg.playerName ~= "" then
   PLAYER_NAME = cfg.playerName
 end
 -- Pairing: AIRSHIP_NAME makes the rednet hostname unique per ship, so a
--- pocket only discovers its own ship. CONTROL_SECRET is a shared password
--- the pocket attaches to every command and the ship verifies; without a
--- match, the command is dropped. Must match between ship and pocket cfgs.
-local AIRSHIP_NAME      = tostring(cfg.airshipName or "main")
-local CONTROL_SECRET    = tostring(cfg.controlSecret or "changeme")
+-- pocket only discovers its own ship.
+--
+-- Auth: pocket holds plaintext (CONTROL_SECRET) in its cfg; ship holds only
+-- the SHA-256 hash (CONTROL_SECRET_HASH). Pocket attaches the plaintext to
+-- every command; ship hashes the received value and compares. Empty hash on
+-- the ship means "no password set, accept anything" -- the open default
+-- before the operator runs `minimap password`. authVersion is reserved for
+-- a future challenge-response upgrade (v2) that keeps the same disk shape,
+-- so flipping it later won't require re-pairing.
+local AIRSHIP_NAME       = tostring(cfg.airshipName or "main")
+local CONTROL_SECRET     = tostring(cfg.controlSecret or "")
+local CONTROL_SECRET_HASH = tostring(cfg.controlSecretHash or "")
+local Sha = dofile("sha256.lua")
+
+-- Ship migration: if a legacy plaintext controlSecret still exists on disk,
+-- hash it into controlSecretHash and strip the plaintext. One-shot per ship.
+if not IS_POCKET and CONTROL_SECRET ~= "" then
+  CONTROL_SECRET_HASH = Sha.hash(CONTROL_SECRET)
+  cfg.controlSecretHash = CONTROL_SECRET_HASH
+  cfg.controlSecret = nil
+  CONTROL_SECRET = ""
+  local ok, Cfg = pcall(dofile, "cfgutil.lua")
+  if ok and Cfg and Cfg.jsonPretty then
+    local body = Cfg.jsonPretty(cfg) .. "\n"
+    if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
+    local fh = fs.open(CONFIG_FILE, "w")
+    fh.write(body); fh.close()
+    print("migrated controlSecret -> controlSecretHash")
+  end
+end
+
+local function authOk(msg)
+  if CONTROL_SECRET_HASH == "" then return true end
+  local got = (type(msg) == "table" and type(msg.secret) == "string") and msg.secret or ""
+  return Sha.hash(got) == CONTROL_SECRET_HASH
+end
 
 local function cfgChannel(name, defaults)
   local cs = cfg.channels
@@ -170,8 +215,37 @@ local CHANNELS = {
   right    = cfgChannel("right",    { relay = "redstone_relay_0", side = "right" }),
   liftUp   = cfgChannel("liftUp",   { relay = "redstone_relay_1", side = "right" }),
   liftDown = cfgChannel("liftDown", { relay = "redstone_relay_1", side = "left"  }),
-  platform = cfgChannel("platform", { relay = "redstone_relay_6", side = "back"  }),
 }
+
+-- User-defined redstone toggles surfaced as tappable rows on the Controls
+-- screen. Each entry registers a channel into CHANNELS under its `name` so
+-- setControl(name, on) works. `inverted` means active = LOW (e.g. a platform
+-- that lowers when redstone power is removed). `mode` is reserved for a
+-- future "pulse" type; only "toggle" is implemented today.
+local DEFAULT_CUSTOM_CONTROLS = {
+  { name = "Platform", relay = "redstone_relay_6", side = "back",
+    mode = "toggle", inverted = true,
+    activeLabel = "LOWERING", inactiveLabel = "RAISED", activeColor = "orange" },
+}
+local CUSTOM_CONTROLS = {}
+do
+  -- Absent key -> defaults. Explicit empty array -> respect it (user wants no controls).
+  local src = (type(cfg.customControls) == "table") and cfg.customControls or DEFAULT_CUSTOM_CONTROLS
+  for _, e in ipairs(src) do
+    if type(e) == "table" and type(e.name) == "string"
+       and type(e.relay) == "string" and type(e.side) == "string" then
+      CHANNELS[e.name] = { relay = e.relay, side = e.side }
+      CUSTOM_CONTROLS[#CUSTOM_CONTROLS + 1] = {
+        name          = e.name,
+        mode          = (e.mode == "pulse") and "pulse" or "toggle",
+        inverted      = (e.inverted == true),
+        activeLabel   = tostring(e.activeLabel or "ON"),
+        inactiveLabel = tostring(e.inactiveLabel or "OFF"),
+        activeColor   = tostring(e.activeColor or "orange"),
+      }
+    end
+  end
+end
 local INPUTS = {
   liftLevel = cfgInput("liftLevel"),
 }
@@ -198,9 +272,11 @@ end
 -- Pocket has no relays so it skips the load entirely.
 local Lift
 local Altitude
+local Cfg  -- only used on the ship for Settings -> cfg writeback
 if not IS_POCKET then
   Lift = dofile("lift.lua")
   Altitude = dofile("altitude.lua")
+  Cfg = dofile("cfgutil.lua")
   Lift.init({
     mode = LIFT_MODE,
     channels = CHANNELS,
@@ -264,12 +340,46 @@ local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
 local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 
 local SETTINGS = {
-  { name = "Cruise AGL", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
-  { name = "Min AGL",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
-  { name = "Hover Brn",  get = function() return HOVER_BURNER end,   set = function(v) HOVER_BURNER = v end,   step = 1,  min = 0,   max = 15  },
-  { name = "Max Speed",  get = function() return MAX_SPEED end,      set = function(v) MAX_SPEED = v end,      step = 1,  min = 1,   max = 20  },
-  { name = "Max Alt",    get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
+  { name = "Cruise AGL", cfgKey = "cruiseAltitudeAboveGround", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
+  { name = "Min AGL",    cfgKey = "minAltitudeAboveGround",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
+  { name = "Hover Brn",  cfgKey = "hoverBurnerLevel",          get = function() return HOVER_BURNER end,   set = function(v) HOVER_BURNER = v end,   step = 1,  min = 0,   max = 15  },
+  { name = "Max Speed",  cfgKey = "maxSpeed",                  get = function() return MAX_SPEED end,      set = function(v) MAX_SPEED = v end,      step = 1,  min = 1,   max = 20  },
+  { name = "Max Alt",    cfgKey = "maxAltitude",               get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
 }
+
+-- Last-persisted snapshot for the Cancel button. Captured at boot from the
+-- cfg-loaded values; refreshed on every successful Save.
+local SETTINGS_SAVED = {}
+local function captureSettingsSaved()
+  for i, s in ipairs(SETTINGS) do SETTINGS_SAVED[i] = s.get() end
+end
+captureSettingsSaved()
+
+local function settingsDirty()
+  for i, s in ipairs(SETTINGS) do
+    if s.get() ~= SETTINGS_SAVED[i] then return true end
+  end
+  return false
+end
+
+-- Ship-side: write current SETTINGS values back to the cfg file via cfgutil.
+-- Pocket never reaches this path (setting_save is forwarded to the ship).
+local function saveSettings()
+  if IS_POCKET then return false end
+  for _, s in ipairs(SETTINGS) do cfg[s.cfgKey] = s.get() end
+  local f = fs.open(CONFIG_FILE, "w")
+  if not f then return false end
+  f.write(Cfg.jsonPretty(cfg) .. "\n")
+  f.close()
+  captureSettingsSaved()
+  return true
+end
+
+local function cancelSettings()
+  for i, s in ipairs(SETTINGS) do
+    if SETTINGS_SAVED[i] ~= nil then s.set(SETTINGS_SAVED[i]) end
+  end
+end
 
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
 local PLAYER_MARKER = { 0x2E, 0x1D }
@@ -304,6 +414,9 @@ local state = {
   phase = nil,          -- nil | CLIMB_TO_CRUISE | CRUISE | LAND
   altHoldActive = false,
   altHoldTarget = nil,
+  aglHoldActive = false,
+  aglHoldOffset = nil,  -- locked AGL offset (m above current groundY)
+  altStep = 1,          -- step size for controls-screen +/- (cycles 1/5/10)
   burnerTarget = nil,   -- manual setpoint from CLI; controller ramps to it, then clears
   landRampStart = nil,      -- os.clock() when LAND phase began
   landRampStartLevel = nil, -- burner level snapshot at LAND entry
@@ -322,7 +435,8 @@ local state = {
   screen = "map",
   wpScroll = 0,
   settingIdx = 1,
-  platformActive = false,
+  pinLock = false,     -- when true, map taps don't drop a pin (prevents fat-finger overwrite of current target)
+  customControls = {}, -- map: custom control name -> active bool
   status = "starting",
   running = true,
   players = {},
@@ -331,6 +445,14 @@ local state = {
   lastFrame = nil,
   lastPos = nil,
   lastError = nil,
+  mapOffsetX = 0,   -- world-unit pan offset from ship position
+  mapOffsetZ = 0,
+  dragPrevX = nil,  -- last touch/drag cell for delta computation
+  dragPrevY = nil,
+  dragPrevTime = 0,
+  isDragging = false,
+  pendingMapTap = nil,   -- {x,y} of first monitor_touch in map area, pending drag/tap disambiguation
+  pendingTapTimer = nil, -- timer id for committing the pending tap
 }
 local buttons = {}
 
@@ -488,6 +610,14 @@ local function cellToWorld(col, row, cx, cz, mapH)
   return wx, wz
 end
 
+-- Pan-adjusted map centre. All tile fetches and overlay calls use this so
+-- panning shifts both tiles and overlays together.
+local function mapCenter()
+  if not state.lastPos then return 0, 0 end
+  return state.lastPos.x + (state.mapOffsetX or 0),
+         state.lastPos.z + (state.mapOffsetZ or 0)
+end
+
 -- (directionForHeading was only used by the stencil arrow; the needle uses the
 -- raw heading directly.)
 
@@ -527,13 +657,21 @@ local function overlayCell(col, row, stenBits, color, mapH, override)
   monitor.blit(string.char(new_pattern + 0x80), new_fg, new_bg)
 end
 
-local function overlaySelfTriangle(heading, mapH)
+local function overlaySelfTriangle(heading, mapH, cx, cz)
   local rad = math.rad(heading or 0)
   local dx = math.sin(rad)
   local dy = -math.cos(rad)  -- compass 0 = N = up = -Y on screen
 
-  local centerCol = math.floor(width / 2 + 0.5)
-  local centerRow = math.floor(mapH / 2 + 0.5)
+  -- When panned, ship is no longer at screen center; compute its actual cell.
+  local centerCol, centerRow
+  if state.lastPos and cx ~= nil then
+    centerCol, centerRow = worldToCell(state.lastPos.x, state.lastPos.z, cx, cz, mapH)
+  else
+    centerCol = math.floor(width / 2 + 0.5)
+    centerRow = math.floor(mapH / 2 + 0.5)
+  end
+  -- Don't draw if ship is scrolled off-screen.
+  if centerCol < 1 or centerCol > width or centerRow < 1 or centerRow > mapH then return end
   local centerSubX = (centerCol - 1) * SUB_W + (SUB_W - 1) / 2
   local centerSubY = (centerRow - 1) * SUB_H + (SUB_H - 1) / 2
 
@@ -754,8 +892,14 @@ end
 local function overlayDotTrail(cx, cz, mapH)
   if not state.target then return end
   local tcol, trow = worldToCell(state.target.x, state.target.z, cx, cz, mapH)
-  local centerCol = math.floor(width / 2 + 0.5)
-  local centerRow = math.floor(mapH / 2 + 0.5)
+  -- Ship's actual cell on the (potentially panned) map.
+  local centerCol, centerRow
+  if state.lastPos then
+    centerCol, centerRow = worldToCell(state.lastPos.x, state.lastPos.z, cx, cz, mapH)
+  else
+    centerCol = math.floor(width / 2 + 0.5)
+    centerRow = math.floor(mapH / 2 + 0.5)
+  end
   local dxC = tcol - centerCol
   local dyC = trow - centerRow
   local steps = math.max(math.abs(dxC), math.abs(dyC))
@@ -825,6 +969,12 @@ end
 -- Altitude tape on the right edge. Zoned thermometer: white above ship, gray
 -- between ship and ground, red below ground; black cursors at ship altitude
 -- and ground level, numeric labels for each.
+-- overlayAltitudeTape is forward-declared here so it can be referenced after
+-- the do-block below.  All tape/burner constants and the two helper functions
+-- (blitTapeCell, drawTapeLabel) live inside the do-block and become upvalues
+-- of the closure -- this avoids 12 top-level local slots.
+local overlayAltitudeTape
+do
 local TAPE_WIDTH = 3
 local TAPE_PAD_RIGHT = 1
 local TAPE_PAD_VERT  = 1
@@ -862,7 +1012,7 @@ local function drawTapeLabel(text, row, anchorCol, bg, fg)
   end
 end
 
-local function overlayAltitudeTape(mapH)
+overlayAltitudeTape = function(mapH)
   -- Skip-if-unchanged: tape depends on altitude, groundY, and the burner marker.
   if SHOW_ALT_TAPE and state.altitude
       and state.altitude == state.lastTapeAlt
@@ -972,10 +1122,15 @@ local function overlayAltitudeTape(mapH)
   state.lastTapeGround = state.groundY
   state.lastBurnerLevel = state.burnerLevel
 end
+end -- do: tape constants + helpers
 
 -- Big speedometer in the bottom-left of the map area. Half-circle dial with
 -- a dark panel background, white scale tick marks, and a red needle. Needle
 -- sweeps left at -max, up at 0, right at +max -- supports negative speed.
+-- overlaySpeedDial is forward-declared; DIAL_* constants live in do-block
+-- below and become upvalues -- saves 7 top-level local slots.
+local overlaySpeedDial
+do
 local DIAL_W = 7
 local DIAL_H = 3
 local DIAL_PAD_LEFT = 1   -- cells of map between dial and left edge
@@ -984,7 +1139,7 @@ local DIAL_BG = "f"       -- void (contrasts with ocean)
 local DIAL_TICK = "0"     -- white scale marks
 local DIAL_NEEDLE = "2"   -- red needle
 
-local function overlaySpeedDial(mapH)
+overlaySpeedDial = function(mapH)
   for key in pairs(state.lastDialCells) do
     local c = math.floor(key / 1024)
     local r = key - c * 1024
@@ -1064,6 +1219,7 @@ local function overlaySpeedDial(mapH)
     end
   end
 end
+end -- do: dial constants
 
 local function setControl(name, on)
   on = on and true or false
@@ -1125,8 +1281,8 @@ local function updatePhase()
   end
 
   if range < ARRIVAL_RADIUS then
-    if state.altHoldActive then
-      -- ALT was engaged in parallel; hand altitude off to it instead of landing.
+    if state.altHoldActive or state.aglHoldActive then
+      -- An altitude lock is on; hand altitude off to it instead of landing.
       state.engaged = false
       state.phase = nil
       setControl("forward", false); setControl("left", false); setControl("right", false)
@@ -1146,7 +1302,11 @@ local function updatePhase()
   end
 
   if state.phase == nil then
-    if agl and agl < CRUISE_ALT_AGL - CLIMB_DONE_MARGIN then
+    -- When an altitude lock is active the user has explicitly chosen the
+    -- altitude; skip CLIMB_TO_CRUISE so horizontal nav starts immediately.
+    if state.altHoldActive or state.aglHoldActive then
+      state.phase = "CRUISE"
+    elseif agl and agl < CRUISE_ALT_AGL - CLIMB_DONE_MARGIN then
       state.phase = "CLIMB_TO_CRUISE"
     else
       state.phase = "CRUISE"
@@ -1155,7 +1315,7 @@ local function updatePhase()
 end
 
 local function altitudeController()
-  if not state.engaged and not state.altHoldActive and not state.burnerTarget then
+  if not state.engaged and not state.altHoldActive and not state.aglHoldActive and not state.burnerTarget then
     -- Idle: hand the burner back to the manual +/- controller on the same
     -- signals. Drop any in-flight pulse and force the outputs LOW so we
     -- never fight a person holding the button.
@@ -1189,11 +1349,17 @@ local function altitudeController()
     local frac = math.min(1, t / math.max(0.001, LAND_RAMP_S))
     desired = math.floor(startLvl + (LAND_BURNER - startLvl) * frac + 0.5)
   else
+    -- Altitude target precedence: ALT lock and AGL lock are explicit user
+    -- intent and win over AUTO's default cruise-AGL. AUTO drives horizontal
+    -- only when a lock is active.
     local targetAlt
-    if state.engaged and state.groundY then
-      targetAlt = state.groundY + CRUISE_ALT_AGL
-    elseif state.altHoldActive then
+    if state.altHoldActive then
       targetAlt = state.altHoldTarget
+    elseif state.aglHoldActive then
+      if not state.groundY then return end
+      targetAlt = state.groundY + state.aglHoldOffset
+    elseif state.engaged and state.groundY then
+      targetAlt = state.groundY + CRUISE_ALT_AGL
     end
     if not targetAlt then return end
 
@@ -1343,6 +1509,10 @@ end
 
 local function drawControlsScreen(mapH)
   clearMapArea(mapH)
+  -- fastTick calls us every tick; reset here so the tappable rows we push
+  -- below don't accumulate between fullRedraws (fullRedraw already clears,
+  -- so this is a no-op there).
+  state.targetCells = {}
   local row = 2
   local function readout(label, value, fg)
     monitor.setCursorPos(2, row)
@@ -1398,35 +1568,63 @@ local function drawControlsScreen(mapH)
     table.insert(state.targetCells, { col1 = 2, col2 = width, row = row, cmd = "alt" })
     row = row + 1
   end
-  if state.engaged and state.autoStatus ~= "" then
-    readout("AUTO", state.autoStatus, colors.lime)
-  end
-  -- Platform: tappable row in the body
+  -- AGL LOCK: tappable row, mirrors ALT LOCK
   do
-    local active = state.platformActive
-    local fg = active and colors.orange or colors.white
+    local active = state.aglHoldActive
+    local fg = active and colors.yellow or colors.white
     local bg = active and colors.gray   or colors.black
-    local label = active and "PLATFORM  [ LOWERING ]" or "PLATFORM  [  RAISED  ]"
+    local label
+    if active and state.aglHoldOffset then
+      label = string.format("AGL LOCK  [ ON @ %dm ]", math.floor(state.aglHoldOffset + 0.5))
+    else
+      label = "AGL LOCK  [  OFF  ]"
+    end
     monitor.setCursorPos(2, row)
     monitor.setTextColor(fg); monitor.setBackgroundColor(bg)
     monitor.write(label:sub(1, width - 1))
-    table.insert(state.targetCells, { col1 = 2, col2 = width, row = row, cmd = "platform_toggle" })
+    table.insert(state.targetCells, { col1 = 2, col2 = width, row = row, cmd = "agl" })
+    row = row + 1
+  end
+  if state.engaged and state.autoStatus ~= "" then
+    readout("AUTO", state.autoStatus, colors.lime)
+  end
+  -- Custom controls: one tappable row per cfg.customControls entry.
+  for _, ctl in ipairs(CUSTOM_CONTROLS) do
+    if row > mapH then break end
+    local active = state.customControls[ctl.name] == true
+    local fg = active and (HEX_TO_COLOR[paletteHexFor(ctl.activeColor)] or colors.orange)
+                       or colors.white
+    local bg = active and colors.gray or colors.black
+    local label = string.format("%-10s[ %s ]",
+      ctl.name:upper():sub(1, 9),
+      active and ctl.activeLabel or ctl.inactiveLabel)
+    monitor.setCursorPos(2, row)
+    monitor.setTextColor(fg); monitor.setBackgroundColor(bg)
+    monitor.write(label:sub(1, width - 1))
+    table.insert(state.targetCells, {
+      col1 = 2, col2 = width, row = row,
+      cmd = "custom_toggle", name = ctl.name,
+    })
     row = row + 1
   end
 end
 
 local function drawSettingsScreen(mapH)
   clearMapArea(mapH)
+  state.targetCells = {}
   monitor.setCursorPos(1, 1)
   monitor.setTextColor(colors.yellow); monitor.setBackgroundColor(colors.black)
-  monitor.write("SETTINGS")
+  local dirty = settingsDirty()
+  monitor.write(dirty and "SETTINGS *" or "SETTINGS")
+  local lastRow = 1
   for i, s in ipairs(SETTINGS) do
     local row = i + 1
     if row > mapH then break end
     local selected = state.settingIdx == i
+    local changed  = s.get() ~= SETTINGS_SAVED[i]
     local bg  = selected and colors.gray or colors.black
     local nfg = selected and colors.white or colors.lightGray
-    local vfg = selected and colors.yellow or colors.white
+    local vfg = changed and colors.orange or (selected and colors.yellow or colors.white)
     local namePart = string.format("%-14s", s.name)
     local valPart  = tostring(s.get())
     local pad = string.rep(" ", math.max(0, width - #namePart - #valPart))
@@ -1437,6 +1635,24 @@ local function drawSettingsScreen(mapH)
     monitor.write(valPart)
     monitor.setTextColor(nfg)
     monitor.write(pad)
+    lastRow = row
+  end
+  -- SAVE / CANCEL: tappable buttons below the list. Live when dirty, dimmed when clean.
+  local btnRow = math.min(mapH, lastRow + 2)
+  if btnRow <= mapH then
+    local saveLabel, cxlLabel = " SAVE ", " CANCEL "
+    local saveBg = dirty and colors.lime or colors.gray
+    local saveFg = dirty and colors.black or colors.lightGray
+    local cxlBg  = dirty and colors.red  or colors.gray
+    local cxlFg  = dirty and colors.white or colors.lightGray
+    local saveCol = 2
+    local cxlCol  = saveCol + #saveLabel + 2
+    monitor.setCursorPos(saveCol, btnRow)
+    monitor.setTextColor(saveFg); monitor.setBackgroundColor(saveBg); monitor.write(saveLabel)
+    monitor.setCursorPos(cxlCol, btnRow)
+    monitor.setTextColor(cxlFg);  monitor.setBackgroundColor(cxlBg);  monitor.write(cxlLabel)
+    table.insert(state.targetCells, { col1 = saveCol, col2 = saveCol + #saveLabel - 1, row = btnRow, cmd = "setting_save" })
+    table.insert(state.targetCells, { col1 = cxlCol,  col2 = cxlCol  + #cxlLabel  - 1, row = btnRow, cmd = "setting_cancel" })
   end
 end
 
@@ -1515,9 +1731,17 @@ local function drawOsd(x, y, z)
   col = col + 1
 
   if state.screen == "map" then
-    drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
     drawButton("zoom_out", col, btnRow, " - "); col = col + 3
+    drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
     drawButton("lod",      col, btnRow, " L" .. state.lod); col = col + 3
+    -- PIN lock: yellow bg when active blocks tap-to-pin so the current
+    -- target can't be accidentally overwritten by a stray map tap.
+    local pinBg = state.pinLock and colors.yellow or colors.lightGray
+    drawButton("pin_lock_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
+    -- CTR button: only visible when map is panned away from ship position.
+    if (state.mapOffsetX or 0) ~= 0 or (state.mapOffsetZ or 0) ~= 0 then
+      drawButton("recenter", col, btnRow, " CTR ", colors.black, colors.cyan); col = col + 5
+    end
     if state.target then
       col = col + 1
       local autoLabel = state.engaged and " STOP " or " AUTO "
@@ -1594,11 +1818,23 @@ local function drawOsd(x, y, z)
     end
 
   elseif state.screen == "controls" then
+    local stepLabel = string.format("%2d ", state.altStep or 1)
+    drawButton("step_cycle",  col, btnRow, stepLabel); col = col + 3
     drawButton("burner_down", col, btnRow, " - "); col = col + 3
     drawButton("burner_up",   col, btnRow, " + "); col = col + 3
-    local modeStr = state.engaged       and ("AUTO " .. (state.autoStatus or ""))
-                 or state.altHoldActive and "ALT HOLD"
-                 or "MANUAL"
+    -- Mode label follows the "lock + target" precedent (e.g. ALT HOLD @ 120m).
+    -- AUTO is orthogonal to ALT/AGL lock: when both are active, both appear.
+    local parts = {}
+    if state.altHoldActive and state.altHoldTarget then
+      parts[#parts+1] = string.format("ALT HOLD @ %dm", math.floor(state.altHoldTarget + 0.5))
+    elseif state.aglHoldActive and state.aglHoldOffset then
+      parts[#parts+1] = string.format("AGL HOLD @ %dm", math.floor(state.aglHoldOffset + 0.5))
+    end
+    if state.engaged then
+      parts[#parts+1] = "AUTO " .. (state.autoStatus or "")
+    end
+    if #parts == 0 then parts[1] = "MANUAL" end
+    local modeStr = table.concat(parts, "  ")
     if width - #modeStr + 1 > col then
       drawText(width - #modeStr + 1, btnRow, modeStr, colors.white, colors.black)
     end
@@ -1672,14 +1908,17 @@ local function fullRedraw()
       state.lastTapeGround = nil
       state.lastBurnerLevel = nil
       state.lastTapeCells = {}
-      overlayDotTrail(state.lastPos.x, state.lastPos.z, mapH)
-      overlayWaypoints(state.lastPos.x, state.lastPos.z, mapH)
-      overlayOtherPlayers(state.lastPos.x, state.lastPos.z, mapH)
-      overlayPin(state.lastPos.x, state.lastPos.z, mapH)
-      overlayMarkerLabels(state.lastPos.x, state.lastPos.z, mapH)
+      local cx, cz = mapCenter()
+      overlayDotTrail(cx, cz, mapH)
+      overlayWaypoints(cx, cz, mapH)
+      overlayOtherPlayers(cx, cz, mapH)
+      overlayPin(cx, cz, mapH)
+      overlayMarkerLabels(cx, cz, mapH)
       overlayAltitudeTape(mapH)
       if not IS_POCKET then overlaySpeedDial(mapH) end
-      overlaySelfTriangle(state.shipHeading, mapH)
+      overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
+    else
+      clearMapArea(mapH)
     end
   elseif state.screen == "waypoints" then
     drawWaypointsScreen(mapH)
@@ -1702,7 +1941,8 @@ local function mapTick()
     drawError(state.shipId and "Waiting for ship state..." or "Looking for ship...")
     return
   end
-  local data, err = httpGetJson(buildUrl(state.lastPos.x, state.lastPos.z))
+  local mcx, mcz = mapCenter()
+  local data, err = httpGetJson(buildUrl(mcx, mcz))
   if data and data.text then
     state.status = "ok"
     state.lastFrame = data
@@ -1718,7 +1958,30 @@ local function mapLoop()
   while state.running do
     local ok, err = pcall(mapTick)
     if not ok then state.lastError = tostring(err) end
-    sleep(FRAME_INTERVAL)
+    -- Interruptible sleep: pan/zoom queue "map_dirty" to wake immediately
+    -- rather than waiting the full FRAME_INTERVAL for fresh tiles.
+    local interval = os.startTimer(FRAME_INTERVAL)
+    local dirty = false
+    while true do
+      local ev, p1 = os.pullEvent()
+      if ev == "map_dirty" then
+        dirty = true
+        os.cancelTimer(interval)
+        break
+      elseif ev == "timer" and p1 == interval then
+        break
+      end
+    end
+    if dirty then
+      -- Short settle: drain any extra dirty events that stacked up from rapid
+      -- gesture steps so we fetch once for the resting position, not once per cell.
+      local settle = os.startTimer(0.05)
+      while true do
+        local ev, p1 = os.pullEvent()
+        if ev == "timer" and p1 == settle then break end
+        -- map_dirty events during the settle window are intentionally consumed
+      end
+    end
   end
 end
 
@@ -1738,7 +2001,8 @@ local function fastTick()
     if state.screen == "map" and state.lastFrame then
       overlayAltitudeTape(mapH)
       if not IS_POCKET then overlaySpeedDial(mapH) end
-      overlaySelfTriangle(state.shipHeading, mapH)
+      local fcx, fcz = mapCenter()
+      overlaySelfTriangle(state.shipHeading, mapH, fcx, fcz)
     elseif state.screen == "controls" then
       drawControlsScreen(mapH)
     end
@@ -1754,6 +2018,11 @@ local function fastLoop()
   end
 end
 
+-- Forward declarations for functions defined later that applyCommand calls.
+-- Without these, Lua sees the names as globals (nil) when applyCommand is compiled.
+local saveControlState
+local loadControlState
+
 -- Mutates state in response to a UI command. Shared by the local touch handler
 -- and (on the ship) the rednet command listener, so a pocket tap and a monitor
 -- tap funnel through the same logic.
@@ -1763,12 +2032,13 @@ local function applyCommand(cmd)
   if id == "zoom_in" then
     state.bpp = clamp(state.bpp / 2, 0.25, 128)
     state.lod = pickLod(state.bpp)
+    os.queueEvent("map_dirty")
   elseif id == "zoom_out" then
     state.bpp = clamp(state.bpp * 2, 0.25, 128)
     state.lod = pickLod(state.bpp)
+    os.queueEvent("map_dirty")
   elseif id == "lod" then
-    state.lod = state.lod + 1
-    if state.lod > 3 then state.lod = 1 end
+    state.lod = math.min(state.lod + 1, 3)
   elseif id == "auto" then
     if state.target then
       state.engaged = not state.engaged
@@ -1785,8 +2055,30 @@ local function applyCommand(cmd)
     else
       state.altHoldActive = true
       state.altHoldTarget = state.altitude
+      -- ALT and AGL are mutually exclusive; the last press wins.
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
     end
     resetLiftIntegrator()
+    saveControlState()
+  elseif id == "agl" then
+    -- Toggle AGL lock at current AGL. Requires groundY to compute the offset;
+    -- silently bail if unknown so the user can retry once BlueMap responds.
+    if state.aglHoldActive then
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
+    elseif state.altitude and state.groundY then
+      state.aglHoldActive = true
+      state.aglHoldOffset = math.max(0, state.altitude - state.groundY)
+      state.altHoldActive = false
+      state.altHoldTarget = nil
+    end
+    resetLiftIntegrator()
+    saveControlState()
+  elseif id == "step_cycle" then
+    -- Cycle the +/- step on the controls screen: 1 -> 5 -> 10 -> 1.
+    local cur = state.altStep or 1
+    state.altStep = (cur == 1 and 5) or (cur == 5 and 10) or 1
   elseif id == "clear_target" then
     state.target = nil
     state.engaged = false
@@ -1814,8 +2106,8 @@ local function applyCommand(cmd)
     state.target = { kind = "cli", name = "GOTO", x = cmd.x, z = cmd.z, color = "1" }
     state.engaged = true
     state.phase = nil
-    state.altHoldActive = false
-    state.altHoldTarget = nil
+    -- ALT/AGL lock is preserved across goto; AUTO drives horizontal only when
+    -- a lock is active. burnerTarget is cleared because manual burner conflicts.
     state.burnerTarget = nil
     state.autoStatus = ""
     resetLiftIntegrator()
@@ -1830,8 +2122,6 @@ local function applyCommand(cmd)
         }
         state.engaged = true
         state.phase = nil
-        state.altHoldActive = false
-        state.altHoldTarget = nil
         state.burnerTarget = nil
         state.autoStatus = ""
         resetLiftIntegrator()
@@ -1847,10 +2137,13 @@ local function applyCommand(cmd)
       state.phase = nil
       state.altHoldActive = false
       state.altHoldTarget = nil
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
       state.burnerTarget = lvl
       state.autoStatus = ""
       resetLiftIntegrator()
       setControl("forward", false); setControl("left", false); setControl("right", false)
+      saveControlState()
     end
 
   elseif id == "stop" then
@@ -1859,33 +2152,70 @@ local function applyCommand(cmd)
     state.phase = nil
     state.altHoldActive = false
     state.altHoldTarget = nil
+    state.aglHoldActive = false
+    state.aglHoldOffset = nil
     state.burnerTarget = nil
     state.autoStatus = ""
     resetLiftIntegrator()
     setControl("forward", false); setControl("left", false); setControl("right", false)
+    saveControlState()
 
   elseif id == "hold" then
     if type(cmd.altitude) == "number" then
       state.altHoldActive = true
       state.altHoldTarget = cmd.altitude
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
       state.burnerTarget = nil
-      state.engaged = false
-      state.phase = nil
-      setControl("forward", false); setControl("left", false); setControl("right", false)
     elseif state.altHoldActive then
       state.altHoldActive = false
       state.altHoldTarget = nil
     else
       state.altHoldActive = true
       state.altHoldTarget = state.altitude
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
       state.burnerTarget = nil
     end
     resetLiftIntegrator()
+    saveControlState()
+  elseif id == "agl_set" then
+    -- CLI: `minimap agl [N]`. No arg = toggle at current AGL. With arg = lock
+    -- at N m above current ground. Requires groundY when engaging.
+    if type(cmd.offset) == "number" then
+      if state.groundY then
+        state.aglHoldActive = true
+        state.aglHoldOffset = math.max(0, cmd.offset)
+        state.altHoldActive = false
+        state.altHoldTarget = nil
+        state.burnerTarget = nil
+      end
+    elseif state.aglHoldActive then
+      state.aglHoldActive = false
+      state.aglHoldOffset = nil
+    elseif state.altitude and state.groundY then
+      state.aglHoldActive = true
+      state.aglHoldOffset = math.max(0, state.altitude - state.groundY)
+      state.altHoldActive = false
+      state.altHoldTarget = nil
+      state.burnerTarget = nil
+    end
+    resetLiftIntegrator()
+    saveControlState()
 
   elseif id == "screen_map"       then state.screen = "map";       fullRedraw()
   elseif id == "screen_waypoints" then state.screen = "waypoints"; state.wpScroll = 0; fullRedraw()
   elseif id == "screen_controls"  then state.screen = "controls";  fullRedraw()
   elseif id == "screen_settings"  then state.screen = "settings";  fullRedraw()
+
+  elseif id == "pin_lock_toggle" then
+    state.pinLock = not state.pinLock
+
+  elseif id == "recenter" then
+    state.mapOffsetX = 0
+    state.mapOffsetZ = 0
+    state.isDragging = false
+    fullRedraw()
 
   elseif id == "wp_scroll_up" then
     state.wpScroll = math.max(0, state.wpScroll - 1)
@@ -1894,16 +2224,46 @@ local function applyCommand(cmd)
     local maxScroll = math.max(0, total - (mapHeight() - 1))
     state.wpScroll = math.min(maxScroll, state.wpScroll + 1)
 
-  elseif id == "platform_toggle" then
-    state.platformActive = not state.platformActive
-    setControl("platform", not state.platformActive)  -- LOW = lowering, HIGH = raised
+  elseif id == "custom_toggle" then
+    local name = cmd.name
+    if type(name) ~= "string" then return end
+    local ctl
+    for _, c in ipairs(CUSTOM_CONTROLS) do
+      if c.name == name then ctl = c; break end
+    end
+    if not ctl then return end
+    local active = not (state.customControls[name] == true)
+    state.customControls[name] = active
+    -- inverted: active = LOW signal; normal: active = HIGH signal
+    setControl(name, ctl.inverted ~= active)
+    saveControlState()
 
   elseif id == "burner_up" then
-    local lvl = math.min(15, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) + 1)
-    applyCommand({ cmd = "set_burner", level = lvl })
+    -- Context-sensitive: bump whichever altitude target is locked, else burner.
+    -- Step is the controls-screen step button (1/5/10).
+    local step = state.altStep or 1
+    if state.altHoldActive and state.altHoldTarget then
+      state.altHoldTarget = state.altHoldTarget + step
+      resetLiftIntegrator()
+    elseif state.aglHoldActive and state.aglHoldOffset then
+      state.aglHoldOffset = state.aglHoldOffset + step
+      resetLiftIntegrator()
+    else
+      local lvl = math.min(15, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) + step)
+      applyCommand({ cmd = "set_burner", level = lvl })
+    end
   elseif id == "burner_down" then
-    local lvl = math.max(0, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) - 1)
-    applyCommand({ cmd = "set_burner", level = lvl })
+    local step = state.altStep or 1
+    if state.altHoldActive and state.altHoldTarget then
+      state.altHoldTarget = state.altHoldTarget - step
+      resetLiftIntegrator()
+    elseif state.aglHoldActive and state.aglHoldOffset then
+      state.aglHoldOffset = math.max(0, state.aglHoldOffset - step)
+      resetLiftIntegrator()
+    else
+      local lvl = math.max(0, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) - step)
+      applyCommand({ cmd = "set_burner", level = lvl })
+    end
 
   elseif id == "setting_prev" then
     state.settingIdx = math.max(1, state.settingIdx - 1)
@@ -1912,9 +2272,17 @@ local function applyCommand(cmd)
   elseif id == "setting_inc" then
     local s = SETTINGS[cmd.idx or state.settingIdx]
     if s then s.set(math.min(s.max, s.get() + s.step)) end
+    if state.screen == "settings" then fullRedraw() end
   elseif id == "setting_dec" then
     local s = SETTINGS[cmd.idx or state.settingIdx]
     if s then s.set(math.max(s.min, s.get() - s.step)) end
+    if state.screen == "settings" then fullRedraw() end
+  elseif id == "setting_save" then
+    saveSettings()
+    if state.screen == "settings" then fullRedraw() end
+  elseif id == "setting_cancel" then
+    cancelSettings()
+    if state.screen == "settings" then fullRedraw() end
   end
 end
 
@@ -1923,6 +2291,9 @@ local LOCAL_CMDS = {
   screen_map=true, screen_waypoints=true, screen_controls=true, screen_settings=true,
   wp_scroll_up=true, wp_scroll_down=true,
   setting_prev=true, setting_next=true,
+  pin_lock_toggle=true,
+  recenter=true,
+  zoom_in=true, zoom_out=true, lod=true,
 }
 
 -- Pocket forwards every command to the ship over rednet, signed with the
@@ -1942,7 +2313,116 @@ local function dispatchCommand(cmd)
   end
 end
 
-local function handleTouch(_, side, x, y)
+local function applyDrag(dx, dy)
+  local bX = state.bpp * SUB_W
+  local bY = state.bpp * SUB_H
+  state.mapOffsetX = (state.mapOffsetX or 0) - dx * bX
+  state.mapOffsetZ = (state.mapOffsetZ or 0) - dy * bY
+  state.isDragging = true
+  -- Slide the cached blit frame immediately so panning feels instant before
+  -- fresh tiles arrive from the server. Exposed edges are filled black.
+  if state.lastFrame then
+    local fw = state.lastFrame.w
+    local fh = state.lastFrame.h
+    local cdx = fw and math.max(-fw, math.min(fw, dx)) or 0
+    local cdy = fh and math.max(-fh, math.min(fh, dy)) or 0
+    if fw and fh and (cdx ~= 0 or cdy ~= 0) then
+      local BCH = string.char(0x40)
+      local bT  = string.rep(BCH, fw)
+      local bC  = string.rep("0", fw)
+      local nt, nf, nb = {}, {}, {}
+      for r = 1, fh do
+        local s = r - cdy
+        if s >= 1 and s <= fh then
+          local t = state.lastFrame.text[s]
+          local f = state.lastFrame.fg[s]
+          local b = state.lastFrame.bg[s]
+          if cdx > 0 then
+            local p = string.rep(BCH, cdx); local pc = string.rep("0", cdx)
+            t = p  .. t:sub(1, fw - cdx)
+            f = pc .. f:sub(1, fw - cdx)
+            b = pc .. b:sub(1, fw - cdx)
+          elseif cdx < 0 then
+            local a = -cdx; local p = string.rep(BCH, a); local pc = string.rep("0", a)
+            t = t:sub(a+1) .. p
+            f = f:sub(a+1) .. pc
+            b = b:sub(a+1) .. pc
+          end
+          nt[r]=t; nf[r]=f; nb[r]=b
+        else
+          nt[r]=bT; nf[r]=bC; nb[r]=bC
+        end
+      end
+      state.lastFrame.text = nt
+      state.lastFrame.fg   = nf
+      state.lastFrame.bg   = nb
+    end
+    fullRedraw()
+  end
+  os.queueEvent("map_dirty")        -- wake mapLoop to fetch correct tiles
+end
+
+-- commitPendingTap is stored on the state table so it can be called from
+-- both handleTouch and eventLoop without needing a top-level local slot.
+state._commitTap = function()
+  local tap = state.pendingMapTap
+  state.pendingMapTap  = nil
+  state.pendingTapTimer = nil
+  if not tap then return end
+  if state.screen == "map" and not state.pinLock
+     and state.lastPos and state.lastFrame and tap.y <= mapHeight() then
+    local cx, cz = mapCenter()
+    local wx, wz = cellToWorld(tap.x, tap.y, cx, cz, mapHeight())
+    dispatchCommand({
+      cmd = "set_target",
+      target = {
+        kind  = "pin",
+        name  = "Pin",
+        x     = math.floor(wx + 0.5),
+        z     = math.floor(wz + 0.5),
+        color = "e",
+      },
+    })
+  end
+end
+
+local function handleTouch(evtName, side, x, y)
+  local mapH = mapHeight()
+  -- Drag detection for map screen: rapid consecutive touches in the map area.
+  -- monitor_touch fires for every cell entered during a drag, so we need to
+  -- disambiguate drag from tap before committing pin placement.
+  local isMonitorTouch = (evtName == "monitor_touch")
+  if state.screen == "map" and state.lastPos and state.lastFrame and y <= mapH then
+    local now = os.clock()
+    local px, py, pt = state.dragPrevX, state.dragPrevY, state.dragPrevTime or 0
+    state.dragPrevX, state.dragPrevY, state.dragPrevTime = x, y, now
+    if px ~= nil and py ~= nil and (now - pt) < 0.6 then
+      local dx, dy = x - px, y - py
+      if math.abs(dx) >= 1 or math.abs(dy) >= 1 then
+        -- Cancel any pending tap — this turned out to be a drag gesture.
+        state.pendingMapTap  = nil
+        state.pendingTapTimer = nil
+        applyDrag(dx, dy)
+        return  -- consume as drag, not a tap
+      end
+    end
+    state.isDragging = false
+    -- For monitor_touch, the first contact in a map area is ambiguous: it
+    -- could be a tap or the start of a drag.  Defer pin placement by 0.25s so
+    -- we can cancel it if the next event is a drag step.
+    if isMonitorTouch and px == nil then
+      state.pendingMapTap  = { x = x, y = y }
+      state.pendingTapTimer = os.startTimer(0.25)
+      return
+    end
+  else
+    state.dragPrevX, state.dragPrevY = nil, nil
+    state.isDragging = false
+    -- Moved out of map area — commit any pending tap (conservative: treat it
+    -- as intentional since a drag would have moved within the map).
+    if state.pendingMapTap then state._commitTap() end
+  end
+
   for id, btn in pairs(buttons) do
     if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
       local c = { cmd = id }
@@ -1956,7 +2436,7 @@ local function handleTouch(_, side, x, y)
   for _, t in ipairs(state.targetCells or {}) do
     if y == t.row and x >= t.col1 and x <= t.col2 then
       if t.cmd then
-        dispatchCommand({ cmd = t.cmd })
+        dispatchCommand({ cmd = t.cmd, name = t.name })
       else
         dispatchCommand({
           cmd = "set_target",
@@ -1966,9 +2446,11 @@ local function handleTouch(_, side, x, y)
       return
     end
   end
-  -- Map tap: place a pin at the tapped world location
-  if state.screen == "map" and state.lastPos and state.lastFrame and y <= mapHeight() then
-    local wx, wz = cellToWorld(x, y, state.lastPos.x, state.lastPos.z, mapHeight())
+  -- Map tap: place a pin at the tapped world location (unless PIN lock is on).
+  if state.screen == "map" and not state.pinLock
+     and state.lastPos and state.lastFrame and y <= mapHeight() then
+    local cx, cz = mapCenter()
+    local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
     dispatchCommand({
       cmd = "set_target",
       target = {
@@ -1997,6 +2479,9 @@ local function stateSnapshot()
     engaged       = state.engaged,
     altHoldActive = state.altHoldActive,
     altHoldTarget = state.altHoldTarget,
+    aglHoldActive = state.aglHoldActive,
+    aglHoldOffset = state.aglHoldOffset,
+    altStep       = state.altStep,
     burnerTarget  = state.burnerTarget,
     phase         = state.phase,
     autoStatus    = state.autoStatus,
@@ -2005,7 +2490,11 @@ local function stateSnapshot()
     cruiseAltAgl    = CRUISE_ALT_AGL,
     minAltAgl       = MIN_ALT_AGL,
     hoverBurner     = HOVER_BURNER,
-    platformActive  = state.platformActive,
+    maxSpeed        = MAX_SPEED,
+    maxAlt          = MAX_ALT,
+    settingsSaved   = SETTINGS_SAVED,   -- so pocket can flag dirty/clean accurately
+    customControls     = state.customControls,
+    customControlsMeta = CUSTOM_CONTROLS, -- schema so pocket renders the ship's actual control list
   }
 end
 
@@ -2014,6 +2503,34 @@ local function eventLoop()
     local event = { os.pullEvent() }
     if event[1] == "monitor_touch" or event[1] == "mouse_click" then
       handleTouch(unpackValues(event))
+    elseif event[1] == "mouse_drag" then
+      -- Pocket terminal drag: event = { "mouse_drag", button, x, y }
+      if state.screen == "map" and state.lastPos and state.lastFrame then
+        local mx, my = event[3], event[4]
+        if state.dragPrevX ~= nil then
+          local dx = mx - state.dragPrevX
+          local dy = my - state.dragPrevY
+          if dx ~= 0 or dy ~= 0 then applyDrag(dx, dy) end
+        end
+        state.dragPrevX, state.dragPrevY = mx, my
+      end
+    elseif event[1] == "mouse_up" then
+      -- End of drag: clear drag state so next click isn't treated as drag delta.
+      state.dragPrevX, state.dragPrevY = nil, nil
+      state.isDragging = false
+    elseif event[1] == "mouse_scroll" then
+      -- Scroll wheel / two-finger swipe on pocket: zoom in/out on the map.
+      -- direction = -1 (scroll up / pinch open) → zoom in (smaller bpp)
+      -- direction =  1 (scroll down / pinch close) → zoom out (larger bpp)
+      if state.screen == "map" then
+        local dir = event[2]  -- -1 or 1
+        dispatchCommand({ cmd = dir < 0 and "zoom_in" or "zoom_out" })
+      end
+    elseif event[1] == "timer" then
+      -- Commit a deferred monitor_touch pin tap once no drag has cancelled it.
+      if event[2] == state.pendingTapTimer then
+        state._commitTap()
+      end
     elseif event[1] == "term_resize" then
       width, height = monitor.getSize()
     elseif event[1] == "key" and event[2] == keys.q then
@@ -2062,15 +2579,26 @@ local function rednetLoop()
           state.engaged       = msg.engaged
           state.altHoldActive = msg.altHoldActive
           state.altHoldTarget = msg.altHoldTarget
+          state.aglHoldActive = msg.aglHoldActive
+          state.aglHoldOffset = msg.aglHoldOffset
+          if msg.altStep then state.altStep = msg.altStep end
           state.burnerTarget  = msg.burnerTarget
           state.phase         = msg.phase
           state.autoStatus    = msg.autoStatus or ""
-          if msg.bpp then state.bpp = msg.bpp end
-          if msg.lod then state.lod = msg.lod end
+          -- bpp/lod are local rendering settings; don't let the ship broadcast
+          -- overwrite the pocket's own zoom level.
           if msg.cruiseAltAgl   then CRUISE_ALT_AGL        = msg.cruiseAltAgl   end
           if msg.minAltAgl      then MIN_ALT_AGL           = msg.minAltAgl      end
           if msg.hoverBurner    then HOVER_BURNER          = msg.hoverBurner    end
-          if msg.platformActive ~= nil then state.platformActive = msg.platformActive end
+          if msg.maxSpeed       then MAX_SPEED             = msg.maxSpeed       end
+          if msg.maxAlt         then MAX_ALT               = msg.maxAlt         end
+          if type(msg.customControls) == "table" then state.customControls = msg.customControls end
+          if type(msg.customControlsMeta) == "table" then CUSTOM_CONTROLS = msg.customControlsMeta end
+          if type(msg.settingsSaved) == "table" then
+            for i = 1, #SETTINGS do
+              if msg.settingsSaved[i] ~= nil then SETTINGS_SAVED[i] = msg.settingsSaved[i] end
+            end
+          end
           state.lastUpdateAt = os.clock()
         end
       end
@@ -2079,7 +2607,7 @@ local function rednetLoop()
     local nextBroadcast = 0
     while state.running do
       local id, msg = rednet.receive(CMD_PROTOCOL, 0.1)
-      if id and type(msg) == "table" and msg.secret == CONTROL_SECRET then
+      if id and type(msg) == "table" and authOk(msg) then
         applyCommand(msg)
       end
       if os.clock() >= nextBroadcast then
@@ -2096,11 +2624,65 @@ local function resetAllOutputs()
   Lift.reset()
 end
 
+-- Persist / restore the controls that have physical side-effects so a reboot
+-- doesn't leave relays in an unknown state.  Only runs on the ship.
+saveControlState = function()
+  if IS_POCKET then return end
+  local ok, data = pcall(textutils.serialiseJSON, {
+    customControls = state.customControls,
+    altHoldActive  = state.altHoldActive,
+    altHoldTarget  = state.altHoldTarget,
+    aglHoldActive  = state.aglHoldActive,
+    aglHoldOffset  = state.aglHoldOffset,
+  })
+  if not ok then return end
+  local f = fs.open("controls.state", "w")
+  if not f then return end
+  f.write(data)
+  f.close()
+end
+
+loadControlState = function()
+  if IS_POCKET then return end
+  if not fs.exists("controls.state") then return end
+  local f = fs.open("controls.state", "r")
+  local raw = f.readAll()
+  f.close()
+  local ok, data = pcall(textutils.unserialiseJSON, raw)
+  if not ok or type(data) ~= "table" then return end
+  -- Restore custom control toggles and re-fire their relays.
+  if type(data.customControls) == "table" then
+    for name, active in pairs(data.customControls) do
+      if type(name) == "string" and type(active) == "boolean" then
+        state.customControls[name] = active
+        for _, ctl in ipairs(CUSTOM_CONTROLS) do
+          if ctl.name == name then
+            setControl(name, ctl.inverted ~= active)
+            break
+          end
+        end
+      end
+    end
+  end
+  -- Restore altitude locks.
+  if data.altHoldActive == true and type(data.altHoldTarget) == "number" then
+    state.altHoldActive = true
+    state.altHoldTarget = data.altHoldTarget
+  end
+  if data.aglHoldActive == true and type(data.aglHoldOffset) == "number" then
+    state.aglHoldActive = true
+    state.aglHoldOffset = data.aglHoldOffset
+  end
+  print("Control state restored from " .. "controls.state")
+end
+
 monitor.setBackgroundColor(colors.black)
 monitor.clear()
 -- A pulse left HIGH by a previous shutdown would jam the burner. Clear every
 -- output before we start so the script always boots from a known state.
 resetAllOutputs()
+-- Restore persisted control state AFTER the reset so saved relay states win.
+loadControlState()
 if modemName then
   parallel.waitForAny(mapLoop, fastLoop, eventLoop, rednetLoop)
 else

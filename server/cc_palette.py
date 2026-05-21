@@ -19,7 +19,7 @@ MAP_PALETTE: tuple[CCColor, ...] = (
     CCColor("shoal",     "3", (160, 208, 240)),
     CCColor("plains",    "4", (156, 195,  74)),
     CCColor("forest",    "5", ( 58, 110,  31)),
-    CCColor("pale",      "6", (207, 216, 156)),
+    CCColor("canopy",    "6", ( 80, 140,  45)),
     CCColor("darkstone", "7", ( 58,  58,  58)),
     CCColor("stone",     "8", (140, 140, 140)),
     CCColor("ocean",     "9", ( 26,  76, 124)),

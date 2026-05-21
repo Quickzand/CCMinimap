@@ -64,6 +64,7 @@ syncFile("ship.lua")
 syncFile("lift.lua")
 syncFile("altitude.lua")
 syncFile("cfgutil.lua")
+syncFile("sha256.lua")
 local Cfg = dofile("cfgutil.lua")
 
 -- 3. Merge new default config keys without overwriting existing ones, then
@@ -91,7 +92,7 @@ end
 
 -- 4. Shell autocomplete for `minimap <subcommand> [args]`. Registered before
 -- minimap launches so the prompt has completions available immediately.
-local SUBCOMMANDS = {"goto", "burner", "stop", "hold", "status", "wp", "help", "--help"}
+local SUBCOMMANDS = {"goto", "burner", "stop", "hold", "agl", "status", "wp", "password", "help", "--help"}
 
 local function suffixesFromPrefix(list, prefix)
   local out = {}

@@ -4,12 +4,15 @@ import io
 import math
 import os
 import re
+import tempfile
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 
 class BlueMapError(RuntimeError):
@@ -25,6 +28,7 @@ class BlueMapConfig:
     map_id: str
     timeout_seconds: float = 10.0
     cache_dir: Path = Path("/tmp/bluemap-minimap-cache")
+    cache_ttl_seconds: float = 86400.0
 
     @classmethod
     def from_env(cls) -> "BlueMapConfig":
@@ -32,14 +36,18 @@ class BlueMapConfig:
         map_id = os.environ.get("BLUEMAP_MAP_ID", "world")
         timeout = float(os.environ.get("BLUEMAP_TIMEOUT_SECONDS", "10"))
         cache_dir = Path(os.environ.get("BLUEMAP_CACHE_DIR", "/tmp/bluemap-minimap-cache"))
+        cache_ttl = float(os.environ.get("BLUEMAP_CACHE_TTL_SECONDS", "86400"))
 
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("BLUEMAP_BASE_URL must be an http(s) origin")
         if not _MAP_ID_RE.fullmatch(map_id):
             raise ValueError("BLUEMAP_MAP_ID contains invalid characters")
+        if cache_ttl < 0:
+            raise ValueError("BLUEMAP_CACHE_TTL_SECONDS must be non-negative")
 
-        return cls(base_url=base_url, map_id=map_id, timeout_seconds=timeout, cache_dir=cache_dir)
+        return cls(base_url=base_url, map_id=map_id, timeout_seconds=timeout,
+                   cache_dir=cache_dir, cache_ttl_seconds=cache_ttl)
 
 
 def split_number_to_path(value: int) -> str:
@@ -62,12 +70,18 @@ class LowresSettings:
     lod_count: int
 
 
+_TILE_MEM_MAX = 128   # max decoded tiles kept in memory (~2 MB each at LOD1)
+_TILE_MEM_TTL = 60.0  # seconds before a memory-cached tile is considered stale
+
+
 class BlueMapClient:
     def __init__(self, config: BlueMapConfig):
         self.config = config
         self.session = requests.Session()
         self.config.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lowres: LowresSettings | None = None
+        # In-memory tile cache: key → (timestamp, Image). OrderedDict for LRU eviction.
+        self._tile_mem: OrderedDict[tuple, tuple[float, Image.Image]] = OrderedDict()
 
     @property
     def map_root(self) -> str:
@@ -98,31 +112,112 @@ class BlueMapClient:
         safe_name = f"lod{lod}_x{tile_x}_z{tile_z}.png".replace("-", "m")
         return self.config.cache_dir / self.config.map_id / safe_name
 
+    def _read_cached_tile(self, cache_path: Path) -> Image.Image | None:
+        """Open a cached tile, returning None if it's missing or corrupt.
+
+        PIL's image.save() is not atomic -- it truncates the destination then
+        writes. Under concurrent requests for the same tile (and any other
+        crash mid-write) a reader can hit a 0-byte or partial PNG file. Treat
+        that as a cache miss so the caller refetches instead of 500-ing.
+        """
+        try:
+            return Image.open(cache_path).convert("RGBA")
+        except (UnidentifiedImageError, OSError):
+            return None
+
+    def _save_tile_atomic(self, image: Image.Image, cache_path: Path) -> None:
+        """Write tile to a sibling tempfile, then os.replace. Prevents the
+        0-byte window concurrent writers would otherwise leave."""
+        fd, tmp_name = tempfile.mkstemp(
+            dir=cache_path.parent, prefix=cache_path.name + ".", suffix=".tmp",
+        )
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            image.save(tmp, format="PNG")
+            os.replace(tmp, cache_path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
     def fetch_lowres_tile(self, lod: int, tile_x: int, tile_z: int) -> Image.Image | None:
         lowres = self.lowres_settings()
         if lod < 1 or lod > lowres.lod_count:
             raise BlueMapError(f"LOD must be between 1 and {lowres.lod_count}")
 
+        mem_key = (lod, tile_x, tile_z)
+        now = time.time()
+
+        # Hot memory cache: skip disk and network entirely for recently decoded tiles.
+        if mem_key in self._tile_mem:
+            ts, img = self._tile_mem[mem_key]
+            if now - ts < _TILE_MEM_TTL:
+                self._tile_mem.move_to_end(mem_key)  # LRU touch
+                return img
+            # Stale in memory — fall through to disk/network refresh.
+
         cache_path = self.tile_cache_path(lod, tile_x, tile_z)
-        if cache_path.exists():
-            return Image.open(cache_path).convert("RGBA")
+        cache_exists = cache_path.exists()
 
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        response = self.session.get(
-            self.tile_url(lod, tile_x, tile_z),
-            timeout=self.config.timeout_seconds,
-            headers={"accept": "image/png"},
-        )
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        if "image/png" not in content_type:
-            return None
+        # Fresh disk cache: decode once and store in memory.
+        if cache_exists:
+            age = now - cache_path.stat().st_mtime
+            if age < self.config.cache_ttl_seconds:
+                cached = self._read_cached_tile(cache_path)
+                if cached is not None:
+                    self._store_tile_mem(mem_key, now, cached)
+                    return cached
+        else:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-        image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-        image.save(cache_path)
-        return image
+        # Stale or missing: try to refresh from upstream. On any failure
+        # (network error, 5xx, non-PNG response), fall back to the stale
+        # cached copy if we have one -- "last good state" is better than
+        # a hole in the frame while BlueMap is down or restarting.
+        try:
+            response = self.session.get(
+                self.tile_url(lod, tile_x, tile_z),
+                timeout=self.config.timeout_seconds,
+                headers={"accept": "image/png"},
+            )
+            if response.status_code == 404:
+                if cache_exists:
+                    img = self._read_cached_tile(cache_path)
+                    if img is not None:
+                        self._store_tile_mem(mem_key, now, img)
+                    return img
+                return None
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "image/png" not in content_type:
+                if cache_exists:
+                    img = self._read_cached_tile(cache_path)
+                    if img is not None:
+                        self._store_tile_mem(mem_key, now, img)
+                    return img
+                return None
+
+            image = Image.open(io.BytesIO(response.content)).convert("RGBA")
+            self._save_tile_atomic(image, cache_path)
+            self._store_tile_mem(mem_key, now, image)
+            return image
+        except requests.RequestException:
+            if cache_exists:
+                img = self._read_cached_tile(cache_path)
+                if img is not None:
+                    self._store_tile_mem(mem_key, now, img)
+                return img
+            raise
+
+    def _store_tile_mem(self, key: tuple, ts: float, img: Image.Image) -> None:
+        """Insert/update memory cache with LRU eviction at _TILE_MEM_MAX entries."""
+        self._tile_mem[key] = (ts, img)
+        self._tile_mem.move_to_end(key)
+        while len(self._tile_mem) > _TILE_MEM_MAX:
+            self._tile_mem.popitem(last=False)
 
     def live_markers(self) -> dict:
         response = self.session.get(
