@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import re
 import os
 import time
@@ -13,6 +14,43 @@ from requests import RequestException
 from bluemap import BlueMapClient, BlueMapConfig, BlueMapError
 from cc_palette import MAP_PALETTE
 from render import encode_blit, parse_frame_request, quantize_to_palette, render_subpixel_image
+
+# Rendered-frame cache: skip all PIL work when the same position/zoom is
+# requested again within the TTL.  Key is quantised to one bpp-unit grid so
+# sub-block ship wobble doesn't bust the cache on every tick.
+_FRAME_CACHE_TTL = 1.0   # seconds a rendered frame stays valid
+_FRAME_CACHE_MAX = 64    # max entries before oldest are evicted
+_frame_cache: dict[tuple, tuple[float, dict]] = {}
+_frame_cache_order: list[tuple] = []
+
+
+def _frame_cache_key(req) -> tuple:
+    snap = req.blocks_per_pixel
+    return (
+        math.floor(req.x / snap),
+        math.floor(req.z / snap),
+        req.width,
+        req.height,
+        req.lod,
+        req.blocks_per_pixel,
+    )
+
+
+def _frame_cache_get(key: tuple) -> dict | None:
+    entry = _frame_cache.get(key)
+    if entry and time.time() - entry[0] < _FRAME_CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _frame_cache_put(key: tuple, result: dict) -> None:
+    _frame_cache[key] = (time.time(), result)
+    if key in _frame_cache_order:
+        _frame_cache_order.remove(key)
+    _frame_cache_order.append(key)
+    while len(_frame_cache_order) > _FRAME_CACHE_MAX:
+        old = _frame_cache_order.pop(0)
+        _frame_cache.pop(old, None)
 
 
 def create_app() -> Flask:
@@ -49,10 +87,14 @@ def create_app() -> Flask:
     def frame():
         try:
             req = parse_frame_request(request.args)
+            key = _frame_cache_key(req)
+            cached = _frame_cache_get(key)
+            if cached is not None:
+                return jsonify(cached)
             image = render_subpixel_image(client, req)
             quant = quantize_to_palette(image)
             text, fg, bg = encode_blit(quant, req.width, req.height)
-            return jsonify({
+            result = {
                 "w": req.width,
                 "h": req.height,
                 "x": req.x,
@@ -60,7 +102,9 @@ def create_app() -> Flask:
                 "text": text,
                 "fg": fg,
                 "bg": bg,
-            })
+            }
+            _frame_cache_put(key, result)
+            return jsonify(result)
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
         except BlueMapError as error:
