@@ -441,9 +441,6 @@ local state = {
   groundY = nil,        -- max surface Y in sampled chunk window (from BlueMap)
   groundYMin = nil,     -- min surface Y in same window
   lastTapeCells = {},   -- cell keys we lit last tape draw, restored next frame
-  lastTapeAlt = nil,    -- altitude value last drawn on tape (for skip-if-unchanged)
-  lastTapeGround = nil, -- ground value last drawn on tape
-  lastBurnerLevel = nil,-- burner level last drawn on tape marker
   shipId = nil,         -- pocket: rednet id of the ship after lookup
   lastUpdateAt = 0,     -- pocket: os.clock() when last state broadcast received
   lastDialCells = {},   -- same idea for the speedometer needle
@@ -1050,17 +1047,22 @@ overlayOtherShips = function(cx, cz, mapH, restampOnly)
 end
 
 overlayWaypoints = function(cx, cz, mapH, restampOnly)
+  -- All waypoints share one ring color so they stand out against any biome.
+  -- Slot "2" is the map palette's lava red-orange -- the warmest color in the
+  -- palette and the most distinct from common terrain (green / blue / sand /
+  -- stone). Selected waypoints flip to "0" (snow white) which is what we
+  -- already had and reads well. We ignore wp.color for the ring; the hitbox
+  -- still carries it so the selected label keeps its per-waypoint accent.
+  local DEFAULT_RING = "2"
+  local SELECTED_RING = "0"
   for _, wp in ipairs(state.waypoints or {}) do
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
-      local color = paletteHexFor(wp.color)
-      -- Selection flips the ring color to white. We can't get a true 2-color
-      -- ring on top of terrain (see overlayMarkerDisc comment), so selection
-      -- is just a clearly contrasting color swap.
-      local ringColor = isSelected("waypoint", wp.name) and "0" or color
+      local labelColor = paletteHexFor(wp.color)
+      local ringColor = isSelected("waypoint", wp.name) and SELECTED_RING or DEFAULT_RING
       local bbox = overlayMarkerDisc(col, row, ringColor, mapH)
       if not restampOnly then
-        registerHitbox(bbox, "waypoint", wp.name, wp.x, wp.z, color)
+        registerHitbox(bbox, "waypoint", wp.name, wp.x, wp.z, labelColor)
       end
     end
   end
@@ -1327,22 +1329,21 @@ local function drawTapeLabel(text, row, anchorCol, mapH)
 end
 
 overlayAltitudeTape = function(mapH)
-  -- Skip-if-unchanged: tape depends on altitude, groundY, and the burner marker.
-  if SHOW_ALT_TAPE and state.altitude
-      and state.altitude == state.lastTapeAlt
-      and state.groundY == state.lastTapeGround
-      and state.burnerLevel == state.lastBurnerLevel then
-    return
-  end
+  -- Always re-stamp. There used to be a skip-if-unchanged optimization here
+  -- (return early when altitude/ground/burner all matched the last draw), but
+  -- that caused flicker on the pocket: the marker labels are drawn earlier in
+  -- the fastTick chain and can overlap the tape's right-edge columns, so they
+  -- repaint over the tape every tick. With skip-if-unchanged active, the tape
+  -- wouldn't re-stamp on top until altitude actually changed (which on the
+  -- pocket is only ~2 Hz, gated by ship broadcasts), so the user saw the tape
+  -- briefly, then labels for ~0.5 s, then tape again. Re-stamping every fastTick
+  -- keeps the tape consistently on top. ~60 cells at 10 Hz is cheap.
   for key in pairs(state.lastTapeCells) do
     local c = math.floor(key / 1024)
     local r = key - c * 1024
     overlayCell(c, r, 0, "0", mapH, true)
   end
   state.lastTapeCells = {}
-  state.lastTapeAlt = nil
-  state.lastTapeGround = nil
-  state.lastBurnerLevel = nil
   if not SHOW_ALT_TAPE or not state.altitude then return end
   local topRow = 1 + TAPE_PAD_VERT
   local botRow = mapH - TAPE_PAD_VERT
@@ -1431,10 +1432,6 @@ overlayAltitudeTape = function(mapH)
       drawTapeLabel(tostring(state.groundY), groundRow, labelAnchor, mapH)
     end
   end
-
-  state.lastTapeAlt = state.altitude
-  state.lastTapeGround = state.groundY
-  state.lastBurnerLevel = state.burnerLevel
 end
 end -- do: tape constants + helpers
 
@@ -2208,9 +2205,6 @@ local function drawOsd(x, y, z)
     end
 
   elseif state.screen == "settings" then
-    drawButton("setting_prev", col, btnRow, " < "); col = col + 3
-    drawButton("setting_next", col, btnRow, " > "); col = col + 3
-    col = col + 1
     drawButton("setting_dec",  col, btnRow, " - "); col = col + 3
     drawButton("setting_inc",  col, btnRow, " + "); col = col + 3
     local s = SETTINGS[state.settingIdx]
@@ -2279,9 +2273,6 @@ local function fullRedraw()
   if state.screen == "map" then
     if state.hasMap then
       drawCachedMap(mapH)
-      state.lastTapeAlt = nil
-      state.lastTapeGround = nil
-      state.lastBurnerLevel = nil
       state.lastTapeCells = {}
       local cx, cz = mapCenter()
       -- drawCachedMap wiped everything, so the previous needle's painted
@@ -2768,10 +2759,6 @@ local function applyCommand(cmd)
       applyCommand({ cmd = "set_burner", level = lvl })
     end
 
-  elseif id == "setting_prev" then
-    state.settingIdx = math.max(1, state.settingIdx - 1)
-  elseif id == "setting_next" then
-    state.settingIdx = math.min(#SETTINGS, state.settingIdx + 1)
   elseif id == "setting_select" then
     local idx = tonumber(cmd.idx)
     if idx and idx >= 1 and idx <= #SETTINGS then
@@ -2815,7 +2802,7 @@ end
 local LOCAL_CMDS = {
   screen_map=true, screen_waypoints=true, screen_controls=true, screen_settings=true,
   wp_scroll_up=true, wp_scroll_down=true,
-  setting_prev=true, setting_next=true, setting_select=true,
+  setting_select=true,
   pin_arm_toggle=true,
   recenter=true,
   zoom_in=true, zoom_out=true, lod=true,
