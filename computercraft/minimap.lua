@@ -400,12 +400,6 @@ local function cancelSettings()
   end
 end
 
--- 2-cell rounded blob for player markers; cells fully replaced with color+black.
-local PLAYER_MARKER = { 0x2E, 0x1D }
-
--- Hollow circle, 2 cells wide -- same footprint as PLAYER_MARKER but outlined.
-local WAYPOINT_MARKER = { 0x26, 0x19 }
-
 -- Autopilot tunables.
 local ARRIVAL_RADIUS = 15      -- blocks; stop when within this of target
 local FOLLOW_LEAVE_RADIUS = 30 -- blocks; in FOLLOW phase, range above this resumes pursuit (hysteresis vs ARRIVAL_RADIUS)
@@ -490,7 +484,12 @@ local state = {
   isDragging = false,
   pendingMapTap = nil,   -- {x,y} of first monitor_touch in map area, pending drag/tap disambiguation
   pendingTapTimer = nil, -- timer id for committing the pending tap
+  -- Transponder: other ships' last-broadcast position/heading, keyed by their
+  -- airshipName. Populated by rednet STATE_PROTOCOL listener; TTL-evicted in
+  -- fastTick after PEER_SHIP_TTL with no fresh broadcast.
+  peerShips = {},
 }
+local PEER_SHIP_TTL = 5.0  -- seconds; ~10x STATE_BROADCAST_INTERVAL
 local buttons = {}
 
 local function findMonitor()
@@ -853,7 +852,8 @@ local function overlaySelfTriangle(heading, mapH, cx, cz)
       local redBits = needleCells[key] or 0
       local darkBits = bit32.band(baseCells[key] or 0, bit32.bnot(redBits))
       if redBits ~= 0 and darkBits ~= 0 then
-        -- drawMarkerCell is defined lower in the file; inline its body.
+        -- Forced fg/bg blit (no terrain bg preserved) because needle + base
+        -- collide on the same cell; the center anchor wins both colours.
         if col >= 1 and col <= width and row >= 1 and row <= mapH then
           local pattern, fg, bg = redBits, "2", "7"
           if bit32.band(pattern, 0x20) ~= 0 then
@@ -896,17 +896,6 @@ local function eraseSelfTriangle(mapH)
   state.lastNeedleCells = {}
 end
 
--- Fully replace a single cell with a teletext pattern using forced fg/bg (no terrain preservation).
-local function drawMarkerCell(col, row, pattern, fg, bg, mapH)
-  if col < 1 or col > width or row < 1 or row > mapH then return end
-  if bit32.band(pattern, 0x20) ~= 0 then
-    pattern = bit32.bxor(pattern, 0x3F)
-    fg, bg = bg, fg
-  end
-  monitor.setCursorPos(col, row)
-  monitor.blit(string.char(pattern + 0x80), fg, bg)
-end
-
 local PLAYER_HEX_SLOTS = { "0", "1", "2", "3", "4", "d" }
 local function colorForPlayer(key)
   local sum = 0
@@ -918,6 +907,134 @@ local function isSelected(kind, name)
   return state.target and state.target.kind == kind and state.target.name == name
 end
 
+-- Rasterize a small heading-oriented filled triangle ("chevron") into the
+-- character cells around (col, row), pointing in headingDeg (compass: 0=N,
+-- 90=E, ...). Tip 3 sub-pixels ahead of center, base 2 behind, half-width 1.5.
+-- Like overlaySelfTriangle but tiny, and using overlayCell(override=true) so
+-- the terrain bg under each cell is preserved -- only the lit sub-pixels
+-- recolour to `color`, so the marker sits on top of the map without masking
+-- it. Footprint is ~2x2 cells for cardinals, occasionally spilling to 3x2 for
+-- diagonals. Returns the bounding box {col1,col2,row1,row2} so callers can
+-- register an appropriately-sized tap target (nil if nothing was painted, e.g.
+-- chevron fully clipped off-screen).
+-- Forward declared so overlayMarkerChevron can fall back to it for headingless
+-- broadcasters (e.g. a future bare-bones beacon with no compass). Defined below.
+local overlayMarkerDisc
+
+local function overlayMarkerChevron(col, row, headingDeg, color, mapH)
+  if headingDeg == nil then
+    -- No heading information -- draw a symmetric disc instead of lying with a
+    -- north-pointing chevron. Used by beacons and any peer broadcasting without
+    -- a compass.
+    return overlayMarkerDisc(col, row, color, mapH)
+  end
+  local rad = math.rad(headingDeg)
+  local dx = math.sin(rad)
+  local dy = -math.cos(rad)
+  local px, py = -dy, dx       -- perpendicular, CCW 90deg
+
+  local cSubX = (col - 1) * SUB_W + (SUB_W - 1) / 2
+  local cSubY = (row - 1) * SUB_H + (SUB_H - 1) / 2
+  local lenAhead, lenBehind, baseHalfW = 3, 2, 1.5
+
+  local cells = {}
+  local function lightSub(sxR, syR)
+    local cc = math.floor(sxR / SUB_W) + 1
+    local rr = math.floor(syR / SUB_H) + 1
+    local sx = sxR - (cc - 1) * SUB_W
+    local sy = syR - (rr - 1) * SUB_H
+    if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
+      local key = cc * 1024 + rr
+      cells[key] = bit32.bor(cells[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
+    end
+  end
+
+  local axisLen = lenAhead + lenBehind
+  local axisSteps = axisLen * 2
+  for i = 0, axisSteps do
+    local t = i / axisSteps  -- 0 at base, 1 at tip
+    local axisOff = -lenBehind + axisLen * t
+    local axCx = cSubX + dx * axisOff
+    local axCy = cSubY + dy * axisOff
+    local half = baseHalfW * (1 - t)
+    local perpSteps = math.max(1, math.ceil(half * 2))
+    for j = 0, perpSteps do
+      local s = -half + (2 * half) * (j / perpSteps)
+      local sxR = math.floor(axCx + px * s + 0.5)
+      local syR = math.floor(axCy + py * s + 0.5)
+      lightSub(sxR, syR)
+    end
+  end
+
+  local minC, maxC, minR, maxR = math.huge, -math.huge, math.huge, -math.huge
+  for key, bits in pairs(cells) do
+    local cc = math.floor(key / 1024)
+    local rr = key - cc * 1024
+    overlayCell(cc, rr, bits, color, mapH, true)
+    if cc < minC then minC = cc end
+    if cc > maxC then maxC = cc end
+    if rr < minR then minR = rr end
+    if rr > maxR then maxR = rr end
+  end
+  if minC == math.huge then return nil end
+  return { col1 = minC, col2 = maxC, row1 = minR, row2 = maxR }
+end
+
+-- Filled disc, sub-pixel rasterized in the same style as the chevron. Used
+-- for static markers (waypoints) and headingless beacons. rSub=1.5 gives a
+-- ~3x3 sub-pixel footprint -> ~2x2 cells in practice. Preserves terrain bg
+-- via overlayCell(override=true).
+overlayMarkerDisc = function(col, row, color, mapH, rSub)
+  rSub = rSub or 1.5
+  local cSubX = (col - 1) * SUB_W + (SUB_W - 1) / 2
+  local cSubY = (row - 1) * SUB_H + (SUB_H - 1) / 2
+  local cells = {}
+  local function lightSub(sxR, syR)
+    local cc = math.floor(sxR / SUB_W) + 1
+    local rr = math.floor(syR / SUB_H) + 1
+    local sx = sxR - (cc - 1) * SUB_W
+    local sy = syR - (rr - 1) * SUB_H
+    if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
+      local key = cc * 1024 + rr
+      cells[key] = bit32.bor(cells[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
+    end
+  end
+  local rmax = math.ceil(rSub)
+  local r2 = rSub * rSub
+  for dy = -rmax, rmax do
+    for dx = -rmax, rmax do
+      if dx * dx + dy * dy <= r2 then
+        lightSub(math.floor(cSubX + dx + 0.5), math.floor(cSubY + dy + 0.5))
+      end
+    end
+  end
+  local minC, maxC, minR, maxR = math.huge, -math.huge, math.huge, -math.huge
+  for key, bits in pairs(cells) do
+    local cc = math.floor(key / 1024)
+    local rr = key - cc * 1024
+    overlayCell(cc, rr, bits, color, mapH, true)
+    if cc < minC then minC = cc end
+    if cc > maxC then maxC = cc end
+    if rr < minR then minR = rr end
+    if rr > maxR then maxR = rr end
+  end
+  if minC == math.huge then return nil end
+  return { col1 = minC, col2 = maxC, row1 = minR, row2 = maxR }
+end
+
+-- Register one targetCells entry per row in the chevron's bounding box so the
+-- tap area matches what's painted. Per-row because the touch matcher only
+-- supports single-row spans (col1..col2 at one row).
+local function registerChevronHitbox(bbox, kind, name, x, z, color)
+  if not bbox then return end
+  for r = bbox.row1, bbox.row2 do
+    table.insert(state.targetCells, {
+      col1 = bbox.col1, col2 = bbox.col2, row = r,
+      kind = kind, name = name, x = x, z = z, color = color,
+    })
+  end
+end
+
 -- restampOnly: skip targetCells mutation so the fastTick re-blit doesn't
 -- multiply click targets between fullRedraws.
 local function overlayOtherPlayers(cx, cz, mapH, restampOnly)
@@ -925,16 +1042,28 @@ local function overlayOtherPlayers(cx, cz, mapH, restampOnly)
     if p.name ~= PLAYER_NAME and p.position then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
       local color = colorForPlayer(p.uuid or p.name or "?")
-      local fg, bg = color, "f"
-      if isSelected("player", p.name) then fg, bg = "f", color end
-      drawMarkerCell(col, row, PLAYER_MARKER[1], fg, bg, mapH)
-      drawMarkerCell(col + 1, row, PLAYER_MARKER[2], fg, bg, mapH)
+      local heading
+      if type(p.rotation) == "table" and type(p.rotation.yaw) == "number" then
+        heading = compassFromMcYaw(p.rotation.yaw)
+      end
+      local bbox = overlayMarkerChevron(col, row, heading, color, mapH)
       if not restampOnly then
-        table.insert(state.targetCells, {
-          col1 = col, col2 = col + 1, row = row,
-          kind = "player", name = p.name,
-          x = p.position.x, z = p.position.z, color = color,
-        })
+        registerChevronHitbox(bbox, "player", p.name, p.position.x, p.position.z, color)
+      end
+    end
+  end
+end
+
+-- Same shape as overlayOtherPlayers but iterates state.peerShips populated by
+-- the rednet transponder. peer.heading already comes in compass convention.
+local function overlayOtherShips(cx, cz, mapH, restampOnly)
+  for name, peer in pairs(state.peerShips or {}) do
+    if peer.x and peer.z then
+      local col, row = worldToCell(peer.x, peer.z, cx, cz, mapH)
+      local color = colorForPlayer(name)
+      local bbox = overlayMarkerChevron(col, row, peer.heading, color, mapH)
+      if not restampOnly then
+        registerChevronHitbox(bbox, "ship", name, peer.x, peer.z, color)
       end
     end
   end
@@ -963,16 +1092,9 @@ local function overlayWaypoints(cx, cz, mapH, restampOnly)
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
       local color = paletteHexFor(wp.color)
-      local fg, bg = color, "f"
-      if isSelected("waypoint", wp.name) then fg, bg = "f", color end
-      drawMarkerCell(col, row, WAYPOINT_MARKER[1], fg, bg, mapH)
-      drawMarkerCell(col + 1, row, WAYPOINT_MARKER[2], fg, bg, mapH)
+      local bbox = overlayMarkerDisc(col, row, color, mapH)
       if not restampOnly then
-        table.insert(state.targetCells, {
-          col1 = col, col2 = col + 1, row = row,
-          kind = "waypoint", name = wp.name,
-          x = wp.x, z = wp.z, color = color,
-        })
+        registerChevronHitbox(bbox, "waypoint", wp.name, wp.x, wp.z, color)
       end
     end
   end
@@ -1049,6 +1171,22 @@ local function overlayMarkerLabels(cx, cz, mapH)
         if lx >= 1 then
           local hexColor = colorForPlayer(p.uuid or p.name or "?")
           blitLabelOverMap(name, lx, row, mapH, hexColor)
+        end
+      end
+    end
+  end
+  -- Other ship callsigns (transponder). Same gating rules as player labels.
+  for name, peer in pairs(state.peerShips or {}) do
+    if peer.x and peer.z
+       and (not selectedOnly or (state.target and state.target.kind == "ship" and state.target.name == name)) then
+      local col, row = worldToCell(peer.x, peer.z, cx, cz, mapH)
+      if row >= 1 and row <= mapH then
+        local label = name:sub(1, CALLSIGN_LEN)
+        local lx = col + 2
+        if lx + #label - 1 > width then lx = math.max(1, col - #label - 1) end
+        if lx >= 1 then
+          local hexColor = colorForPlayer(name)
+          blitLabelOverMap(label, lx, row, mapH, hexColor)
         end
       end
     end
@@ -1462,8 +1600,16 @@ end
 
 local function updatePhase()
   if not state.engaged then state.phase = nil; return end
-  if not state.target or not state.lastPos then
+  if not state.target then
+    -- engaged true with no target = stale; clear and persist so the wipe survives a reboot.
     state.engaged = false
+    state.phase = nil
+    saveControlState()
+    return
+  end
+  if not state.lastPos then
+    -- No GPS sample yet (boot race or transient loss). Hold engaged but stand down
+    -- the phase machine until a position arrives; horizontalController bails on its own.
     state.phase = nil
     return
   end
@@ -1478,6 +1624,7 @@ local function updatePhase()
       state.engaged = false
       state.phase = nil
       state.autoStatus = "LANDED"
+      saveControlState()
     end
     return
   end
@@ -1493,8 +1640,8 @@ local function updatePhase()
   end
 
   if range < ARRIVAL_RADIUS then
-    if state.target.kind == "player" then
-      -- Player targets follow indefinitely: hover here, ignore the LAND/ARRIVED
+    if state.target.kind == "player" or state.target.kind == "ship" then
+      -- Player/ship targets follow indefinitely: hover here, ignore the LAND/ARRIVED
       -- paths. The user disengages via STOP or by picking a different target.
       state.phase = "FOLLOW"
       state.autoStatus = "FOLLOW"
@@ -1507,6 +1654,7 @@ local function updatePhase()
       state.phase = nil
       setControl("forward", false); setControl("left", false); setControl("right", false)
       state.autoStatus = "ARRIVED"
+      saveControlState()
     else
       state.phase = "LAND"
       state.landRampStart = os.clock()
@@ -1554,6 +1702,7 @@ local function altitudeController()
     if not state.burnerLevel then return end
     if state.burnerLevel == state.burnerTarget then
       state.burnerTarget = nil
+      saveControlState()
       return
     end
     Lift.commandLevel(state.burnerTarget)
@@ -2005,6 +2154,9 @@ local function drawOsd(x, y, z)
       local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapHeight())
       pInfo = pInfo .. ":" .. pcol .. "," .. prow
     end
+    local sCount = 0
+    for _ in pairs(state.peerShips or {}) do sCount = sCount + 1 end
+    if sCount > 0 then pInfo = pInfo .. " S" .. sCount end
     local segs
     if state.target then
       local dx    = (state.target.x or 0) - (state.lastPos and state.lastPos.x or 0)
@@ -2141,6 +2293,13 @@ local function fullRedraw()
       end
     end
   end
+  if state.target and state.target.kind == "ship" then
+    local peer = state.peerShips and state.peerShips[state.target.name]
+    if peer and peer.x and peer.z then
+      state.target.x = peer.x
+      state.target.z = peer.z
+    end
+  end
   local mapH = mapHeight()
   state.targetCells = {}
   if state.screen == "map" then
@@ -2162,6 +2321,7 @@ local function fullRedraw()
       overlayDotTrail(cx, cz, mapH)
       overlayWaypoints(cx, cz, mapH)
       overlayOtherPlayers(cx, cz, mapH)
+      overlayOtherShips(cx, cz, mapH)
       overlayPin(cx, cz, mapH)
       overlayMarkerLabels(cx, cz, mapH)
       if not IS_POCKET then overlaySpeedDial(mapH) end
@@ -2353,6 +2513,7 @@ local function fastTick()
       overlayDotTrail(fcx, fcz, mapH)
       overlayWaypoints(fcx, fcz, mapH, true)
       overlayOtherPlayers(fcx, fcz, mapH, true)
+      overlayOtherShips(fcx, fcz, mapH, true)
       overlayPin(fcx, fcz, mapH)
       overlayMarkerLabels(fcx, fcz, mapH)
       overlaySelfTriangle(state.shipHeading, mapH, fcx, fcz)
@@ -2409,6 +2570,7 @@ local function applyCommand(cmd)
       if not state.engaged then
         setControl("forward", false); setControl("left", false); setControl("right", false)
       end
+      saveControlState()
     end
   elseif id == "alt" then
     if state.altHoldActive then
@@ -2448,6 +2610,7 @@ local function applyCommand(cmd)
     state.autoStatus = ""
     resetLiftIntegrator()
     setControl("forward", false); setControl("left", false); setControl("right", false)
+    saveControlState()
   elseif id == "set_target" and type(cmd.target) == "table" then
     state.target = {
       kind = cmd.target.kind,
@@ -2460,6 +2623,7 @@ local function applyCommand(cmd)
     state.autoStatus = ""
     resetLiftIntegrator()
     os.queueEvent("map_dirty")  -- wake mapLoop so overlayPin renders without waiting for FRAME_INTERVAL
+    saveControlState()
 
   -- ---- CLI commands ---------------------------------------------------------
   -- Each handler is the receiving end of a `ship <cmd>` invocation; see
@@ -2474,6 +2638,7 @@ local function applyCommand(cmd)
     state.burnerTarget = nil
     state.autoStatus = ""
     resetLiftIntegrator()
+    saveControlState()
 
   elseif id == "goto_wp" and type(cmd.name) == "string" then
     local target = cmd.name:lower()
@@ -2488,6 +2653,7 @@ local function applyCommand(cmd)
         state.burnerTarget = nil
         state.autoStatus = ""
         resetLiftIntegrator()
+        saveControlState()
         break
       end
     end
@@ -2822,6 +2988,7 @@ end
 -- response to a local "ship_state_request" event from ship.lua.
 local function stateSnapshot()
   return {
+    airshipName   = AIRSHIP_NAME,   -- transponder: peers route by this to identify sender vs self
     lastPos       = state.lastPos,
     shipHeading   = state.shipHeading,
     altitude      = state.altitude,
@@ -2908,8 +3075,49 @@ local function eventLoop()
   end
 end
 
--- Ship: broadcast a state snapshot every STATE_BROADCAST_INTERVAL and apply
--- inbound commands. Pocket: lookup the ship and consume its state broadcasts.
+-- Transponder: ingest a state broadcast from another ship and stash its
+-- position/heading under its airshipName. Also updates state.target if the
+-- local autopilot is currently following that ship, so the chase point
+-- tracks the peer's motion (same pattern as player-follow at fullRedraw).
+local function handlePeerState(msg)
+  if type(msg) ~= "table" then return end
+  local name = msg.airshipName
+  if type(name) ~= "string" or name == "" then return end
+  if name == AIRSHIP_NAME then return end  -- our own broadcast looped back
+  local pos = msg.lastPos
+  if type(pos) ~= "table" or type(pos.x) ~= "number" or type(pos.z) ~= "number" then return end
+  local entry = state.peerShips[name]
+  if not entry then
+    entry = {}
+    state.peerShips[name] = entry
+  end
+  entry.x        = pos.x
+  entry.z        = pos.z
+  entry.y        = pos.y
+  entry.heading  = msg.shipHeading
+  entry.altitude = msg.altitude
+  entry.velocity = msg.velocity
+  entry.seenAt   = os.clock()
+  if state.target and state.target.kind == "ship" and state.target.name == name then
+    state.target.x = entry.x
+    state.target.z = entry.z
+  end
+end
+
+local function evictStalePeers()
+  local now = os.clock()
+  for name, peer in pairs(state.peerShips) do
+    if (now - (peer.seenAt or 0)) > PEER_SHIP_TTL then
+      state.peerShips[name] = nil
+    end
+  end
+end
+
+-- Ship: broadcast a state snapshot every STATE_BROADCAST_INTERVAL, apply
+-- inbound commands, and ingest peer broadcasts. Pocket: look up its own
+-- ship, consume that ship's state broadcasts, and also pick up peer ship
+-- broadcasts directly off the air so peers don't have to round-trip
+-- through the host ship.
 local function rednetLoop()
   if not modemName then
     while state.running do sleep(1) end
@@ -2922,6 +3130,13 @@ local function rednetLoop()
         if not state.shipId then sleep(LOOKUP_RETRY_INTERVAL) end
       else
         local id, msg = rednet.receive(STATE_PROTOCOL, 1.0)
+        if id and type(msg) == "table" and id ~= state.shipId
+           and type(msg.airshipName) == "string" and msg.airshipName ~= AIRSHIP_NAME then
+          -- A different ship's broadcast on the shared STATE_PROTOCOL.
+          handlePeerState(msg)
+          os.queueEvent("map_dirty")  -- repaint peer chevron without waiting for mapTick
+        end
+        evictStalePeers()
         if id == state.shipId and type(msg) == "table" then
           if msg.lastPos then state.lastPos = msg.lastPos end
           state.shipHeading   = msg.shipHeading or state.shipHeading
@@ -2969,13 +3184,20 @@ local function rednetLoop()
   else
     local nextBroadcast = 0
     while state.running do
-      local id, msg = rednet.receive(CMD_PROTOCOL, 0.1)
-      if id and type(msg) == "table" and authOk(msg) then
-        applyCommand(msg)
+      -- Receive any protocol so we can demux CMD_PROTOCOL (pocket -> ship)
+      -- and STATE_PROTOCOL (peer ship transponder) on the same modem.
+      local id, msg, proto = rednet.receive(nil, 0.1)
+      if id and type(msg) == "table" then
+        if proto == CMD_PROTOCOL then
+          if authOk(msg) then applyCommand(msg) end
+        elseif proto == STATE_PROTOCOL then
+          handlePeerState(msg)
+        end
       end
       if os.clock() >= nextBroadcast then
         pcall(rednet.broadcast, stateSnapshot(), STATE_PROTOCOL)
         nextBroadcast = os.clock() + STATE_BROADCAST_INTERVAL
+        evictStalePeers()
       end
     end
   end
@@ -2997,12 +3219,22 @@ saveControlState = function()
     altHoldTarget  = state.altHoldTarget,
     aglHoldActive  = state.aglHoldActive,
     aglHoldOffset  = state.aglHoldOffset,
+    target         = state.target,
+    engaged        = state.engaged,
+    burnerTarget   = state.burnerTarget,
   })
   if not ok then return end
   local f = fs.open("controls.state", "w")
   if not f then return end
   f.write(data)
   f.close()
+end
+
+local function isValidTarget(t)
+  return type(t) == "table"
+     and type(t.kind) == "string"
+     and type(t.x) == "number"
+     and type(t.z) == "number"
 end
 
 loadControlState = function()
@@ -3036,6 +3268,18 @@ loadControlState = function()
     state.aglHoldActive = true
     state.aglHoldOffset = data.aglHoldOffset
   end
+  -- Restore autopilot target + engagement. engaged is only honoured if a valid
+  -- target is also restored; the controller would clear an engaged-without-target
+  -- on the first tick anyway.
+  if isValidTarget(data.target) then
+    state.target = {
+      kind = data.target.kind, name = data.target.name,
+      x = data.target.x, z = data.target.z, color = data.target.color,
+    }
+    if data.engaged == true then state.engaged = true end
+  end
+  -- Restore in-flight manual burner setpoint.
+  if type(data.burnerTarget) == "number" then state.burnerTarget = data.burnerTarget end
   print("Control state restored from " .. "controls.state")
 end
 
