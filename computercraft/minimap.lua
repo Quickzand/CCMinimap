@@ -1047,18 +1047,16 @@ overlayOtherShips = function(cx, cz, mapH, restampOnly)
 end
 
 overlayWaypoints = function(cx, cz, mapH, restampOnly)
-  -- Ring color is one fixed high-contrast slot so waypoints stand out against
-  -- any biome. Slot "2" (lava red-orange) is the warmest in the map palette
-  -- and distinct from common terrain (green / blue / sand / stone). Selected
-  -- flips to "0" (snow white). Per-waypoint identity comes from the letter
-  -- badge below, not the ring color.
-  local DEFAULT_RING = "2"
+  -- Ring color is the per-waypoint accent (wp.color from the server). Selected
+  -- flips to "0" (snow white) so the active target still pops regardless of
+  -- the waypoint's own color. Letter badge below uses the same accent so the
+  -- color and letter together identify the waypoint at a glance.
   local SELECTED_RING = "0"
   for _, wp in ipairs(state.waypoints or {}) do
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
       local labelColor = paletteHexFor(wp.color)
-      local ringColor = isSelected("waypoint", wp.name) and SELECTED_RING or DEFAULT_RING
+      local ringColor = isSelected("waypoint", wp.name) and SELECTED_RING or labelColor
       local bbox = overlayMarkerDisc(col, row, ringColor, mapH)
       -- Letter badge: first char of wp.name in the waypoint's accent color,
       -- placed one cell off the ring's right edge. Lets you tell waypoints
