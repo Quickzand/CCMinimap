@@ -385,19 +385,19 @@ local function cancelSettings()
   end
 end
 
--- Bitmap font for callsigns drawn next to player markers. 3x3-Mono is the
--- smallest font in the morefonts pack (4x3 sub-pixels per glyph); a 3-char
--- callsign fits in ~6-7 cells x 1 row.  Load is intentionally unguarded so a
--- missing/broken font surfaces as a real error instead of a silent fall-back
--- to the previous full-name label.  morefonts internally calls require() at
--- module load (for cc.expect), and CC:Tweaked's dofile() does not inherit
--- require into the loaded chunk's _ENV -- so it has to come in via require,
--- not dofile, even though our other modules use dofile.
+-- Bitmap font for callsigns drawn next to player markers. PixelPlace is 4x6
+-- sub-pixels per glyph -- 2 cells tall, narrow enough that a 4-char callsign
+-- still fits in roughly 9 cells of width.  Load is intentionally unguarded so
+-- a missing/broken font surfaces as a real error instead of a silent
+-- fall-back.  morefonts internally calls require() at module load (for
+-- cc.expect), and CC:Tweaked's dofile() does not inherit require into the
+-- loaded chunk's _ENV, so it has to come in via require, not dofile, even
+-- though our other modules use dofile.
 local mf = require("morefonts")
-local callsignFont = mf.loadFont("fonts/3x3-Mono")
+local callsignFont = mf.loadFont("fonts/PixelPlace")
 
 local function callsign(name)
-  return (name or "?"):sub(1, 3):upper()
+  return (name or "?"):sub(1, 4):upper()
 end
 
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.

@@ -70,6 +70,7 @@ syncFile("morefonts.lua")
 -- so just ensure the parent dir exists before fetching.
 if not fs.isDir("fonts") then fs.makeDir("fonts") end
 syncFile("fonts/3x3-Mono")
+syncFile("fonts/PixelPlace")
 local Cfg = dofile("cfgutil.lua")
 
 -- 3. Merge new default config keys without overwriting existing ones, then
