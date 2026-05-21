@@ -2284,18 +2284,18 @@ local function fullRedraw()
       -- to "restore" them next tick (would be a no-op but a wasteful one).
       state.lastNeedleCells = {}
       -- Order must match fastTick so markers/labels never blink off in the
-      -- gap between a fullRedraw (1Hz) and the next fastTick (10Hz). Needle
-      -- and altitude tape paint last so they sit on top of any marker that
-      -- happens to land in their cells.
+      -- gap between a fullRedraw (1Hz) and the next fastTick (10Hz). Needle,
+      -- altitude tape, and speed dial paint last so they sit on top of any
+      -- marker that happens to land in their cells.
       overlayDotTrail(cx, cz, mapH)
       overlayWaypoints(cx, cz, mapH)
       overlayOtherPlayers(cx, cz, mapH)
       overlayOtherShips(cx, cz, mapH)
       overlayPin(cx, cz, mapH)
       overlayMarkerLabels(cx, cz, mapH)
-      if not IS_POCKET then overlaySpeedDial(mapH) end
       overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
       overlayAltitudeTape(mapH)
+      if not IS_POCKET then overlaySpeedDial(mapH) end
     else
       clearMapArea(mapH)
     end
@@ -2470,14 +2470,13 @@ local function fastTick()
   if state.lastPos then
     local mapH = mapHeight()
     if state.screen == "map" and state.hasMap then
-      if not IS_POCKET then overlaySpeedDial(mapH) end
       local fcx, fcz = mapCenter()
       -- Erase the cells the old needle owned so a marker that's now
       -- there can repaint cleanly. Then paint the world overlays, then
-      -- the needle and altitude tape on top so they're never obscured.
-      -- Mutating overlays (waypoints, players) run in restamp-only mode
-      -- so the fastTick re-blit doesn't multiply click targets between
-      -- fullRedraws.
+      -- the needle, altitude tape, and speed dial on top so they're never
+      -- obscured. Mutating overlays (waypoints, players) run in restamp-
+      -- only mode so the fastTick re-blit doesn't multiply click targets
+      -- between fullRedraws.
       eraseSelfTriangle(mapH)
       overlayDotTrail(fcx, fcz, mapH)
       overlayWaypoints(fcx, fcz, mapH, true)
@@ -2487,6 +2486,7 @@ local function fastTick()
       overlayMarkerLabels(fcx, fcz, mapH)
       overlaySelfTriangle(state.shipHeading, mapH, fcx, fcz)
       overlayAltitudeTape(mapH)
+      if not IS_POCKET then overlaySpeedDial(mapH) end
     elseif state.screen == "controls" then
       drawControlsScreen(mapH)
     end
