@@ -474,8 +474,15 @@ local state = {
   tileOriginZ = 0,
   lastPos = nil,
   lastError = nil,
-  mapOffsetX = 0,   -- world-unit pan offset from ship position
+  -- Pan model: when not panned (panAnchorX == nil), the view follows the ship
+  -- and mapOffsetX/Z is just zero. The first drag captures the ship's current
+  -- world position into panAnchorX/Z and switches the view to anchor + offset
+  -- so subsequent ship motion doesn't scroll the view out from under the user.
+  -- Recenter clears the anchor and resumes follow-the-ship.
+  mapOffsetX = 0,
   mapOffsetZ = 0,
+  panAnchorX = nil,
+  panAnchorZ = nil,
   dragPrevX = nil,  -- last touch/drag cell for delta computation
   dragPrevY = nil,
   dragPrevTime = 0,
@@ -622,8 +629,11 @@ end
 -- panning shifts both tiles and overlays together.
 local function mapCenter()
   if not state.lastPos then return 0, 0 end
-  return state.lastPos.x + (state.mapOffsetX or 0),
-         state.lastPos.z + (state.mapOffsetZ or 0)
+  -- When panned, the view base is the anchor world position captured when the
+  -- user first dragged. When not panned, the base is the live ship position.
+  local baseX = state.panAnchorX or state.lastPos.x
+  local baseZ = state.panAnchorZ or state.lastPos.z
+  return baseX + (state.mapOffsetX or 0), baseZ + (state.mapOffsetZ or 0)
 end
 
 -- Tile grid helpers. The world is partitioned into width*mapH-cell tiles
@@ -1545,6 +1555,16 @@ overlaySpeedDial = function(mapH)
 end
 end -- do: dial constants
 
+-- Forward declarations for functions defined late in the file (near boot).
+-- The controller code below (updatePhase, altitudeController, etc.) calls
+-- saveControlState on engagement / hold transitions; applyCommand calls it
+-- on every UI mutation. Without forward-decl at chunk level above the first
+-- caller, Lua compiles each call as a global lookup and the function is nil
+-- at runtime.
+local saveControlState
+local loadControlState
+
+
 local function setControl(name, on)
   on = on and true or false
   state.controls[name] = on
@@ -2099,7 +2119,7 @@ local function drawOsd(x, y, z)
   if state.screen == "map" then
     drawButton("zoom_out", col, btnRow, " - "); col = col + 3
     drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
-    local panned = (state.mapOffsetX or 0) ~= 0 or (state.mapOffsetZ or 0) ~= 0
+    local panned = state.panAnchorX ~= nil
     if IS_POCKET then
       -- Pocket bar is too narrow for L2 + PIN + CTR; the L2 slot becomes a
       -- recenter button instead. Always drawn so the bar layout stays stable;
@@ -2515,11 +2535,6 @@ local function fastLoop()
   end
 end
 
--- Forward declarations for functions defined later that applyCommand calls.
--- Without these, Lua sees the names as globals (nil) when applyCommand is compiled.
-local saveControlState
-local loadControlState
-
 -- Mutates state in response to a UI command. Shared by the local touch handler
 -- and (on the ship) the rednet command listener, so a pocket tap and a monitor
 -- tap funnel through the same logic.
@@ -2725,6 +2740,8 @@ local function applyCommand(cmd)
   elseif id == "recenter" then
     state.mapOffsetX = 0
     state.mapOffsetZ = 0
+    state.panAnchorX = nil
+    state.panAnchorZ = nil
     state.isDragging = false
     fullRedraw()
 
@@ -2850,6 +2867,12 @@ end
 local function applyDrag(dx, dy)
   local bX = state.bpp * SUB_W
   local bY = state.bpp * SUB_H
+  -- First drag freezes the view at the ship's current world position. From
+  -- here on the offset is relative to that anchor, not the live ship.
+  if not state.panAnchorX and state.lastPos then
+    state.panAnchorX = state.lastPos.x
+    state.panAnchorZ = state.lastPos.z
+  end
   state.mapOffsetX = (state.mapOffsetX or 0) - dx * bX
   state.mapOffsetZ = (state.mapOffsetZ or 0) - dy * bY
   state.isDragging = true
