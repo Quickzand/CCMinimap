@@ -20,7 +20,7 @@ local SERVER = "__SERVER_URL__"
 local PLAYER_NAME = "__PLAYER_NAME__"
 local NAV_PERIPHERAL = nil
 local NAV_METHOD = nil
-local FRAME_INTERVAL = 0.5
+local FRAME_INTERVAL = 1.0
 local NAV_INTERVAL = 0.1
 local SIDECAR_INTERVAL = 2.5
 
@@ -2038,7 +2038,8 @@ local function applyCommand(cmd)
     state.lod = pickLod(state.bpp)
     os.queueEvent("map_dirty")
   elseif id == "lod" then
-    state.lod = math.min(state.lod + 1, 3)
+    state.lod = state.lod + 1
+    if state.lod > 3 then state.lod = 1 end
   elseif id == "auto" then
     if state.target then
       state.engaged = not state.engaged
