@@ -895,7 +895,9 @@ local function isSelected(kind, name)
   return state.target and state.target.kind == kind and state.target.name == name
 end
 
-local function overlayOtherPlayers(cx, cz, mapH)
+-- restampOnly: skip targetCells mutation so the fastTick re-blit doesn't
+-- multiply click targets between fullRedraws.
+local function overlayOtherPlayers(cx, cz, mapH, restampOnly)
   for _, p in ipairs(state.players or {}) do
     if p.name ~= PLAYER_NAME and p.position then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
@@ -904,11 +906,13 @@ local function overlayOtherPlayers(cx, cz, mapH)
       if isSelected("player", p.name) then fg, bg = "f", color end
       drawMarkerCell(col, row, PLAYER_MARKER[1], fg, bg, mapH)
       drawMarkerCell(col + 1, row, PLAYER_MARKER[2], fg, bg, mapH)
-      table.insert(state.targetCells, {
-        col1 = col, col2 = col + 1, row = row,
-        kind = "player", name = p.name,
-        x = p.position.x, z = p.position.z, color = color,
-      })
+      if not restampOnly then
+        table.insert(state.targetCells, {
+          col1 = col, col2 = col + 1, row = row,
+          kind = "player", name = p.name,
+          x = p.position.x, z = p.position.z, color = color,
+        })
+      end
     end
   end
 end
@@ -931,7 +935,7 @@ local HEX_TO_COLOR = {
   ["f"]=colors.black,
 }
 
-local function overlayWaypoints(cx, cz, mapH)
+local function overlayWaypoints(cx, cz, mapH, restampOnly)
   for _, wp in ipairs(state.waypoints or {}) do
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
@@ -940,11 +944,13 @@ local function overlayWaypoints(cx, cz, mapH)
       if isSelected("waypoint", wp.name) then fg, bg = "f", color end
       drawMarkerCell(col, row, WAYPOINT_MARKER[1], fg, bg, mapH)
       drawMarkerCell(col + 1, row, WAYPOINT_MARKER[2], fg, bg, mapH)
-      table.insert(state.targetCells, {
-        col1 = col, col2 = col + 1, row = row,
-        kind = "waypoint", name = wp.name,
-        x = wp.x, z = wp.z, color = color,
-      })
+      if not restampOnly then
+        table.insert(state.targetCells, {
+          col1 = col, col2 = col + 1, row = row,
+          kind = "waypoint", name = wp.name,
+          x = wp.x, z = wp.z, color = color,
+        })
+      end
     end
   end
 end
@@ -2298,9 +2304,13 @@ local function fastTick()
       if not IS_POCKET then overlaySpeedDial(mapH) end
       local fcx, fcz = mapCenter()
       overlaySelfTriangle(state.shipHeading, mapH, fcx, fcz)
-      -- Re-stamp labels after the needle redraw so names inside the needle
-      -- bounding box don't flicker off between fullRedraws (1Hz) while
-      -- fastTick wipes/redraws the needle area at 10Hz.
+      -- Re-stamp everything the needle wipe might have eaten: trail dots,
+      -- waypoint and player markers, pin, and labels. Mutating overlays
+      -- (waypoints, players) run in restamp-only mode so they don't multiply
+      -- click targets between fullRedraws. 10Hz x ~20 cells is negligible.
+      overlayDotTrail(fcx, fcz, mapH)
+      overlayWaypoints(fcx, fcz, mapH, true)
+      overlayOtherPlayers(fcx, fcz, mapH, true)
       overlayPin(fcx, fcz, mapH)
       overlayMarkerLabels(fcx, fcz, mapH)
     elseif state.screen == "controls" then
