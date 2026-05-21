@@ -2143,7 +2143,7 @@ local function applyCommand(cmd)
     local active = not (state.customControls[name] == true)
     state.customControls[name] = active
     -- inverted: active = LOW signal; normal: active = HIGH signal
-    setControl(name, ctl.inverted and (not active) or active)
+    setControl(name, ctl.inverted ~= active)
 
   elseif id == "burner_up" then
     -- Context-sensitive: bump whichever altitude target is locked, else burner.
