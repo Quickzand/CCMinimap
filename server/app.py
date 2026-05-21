@@ -306,6 +306,22 @@ def create_app() -> Flask:
     def sha256_lua():
         return serve_lua("/app/computercraft/sha256.lua")
 
+    @app.get("/morefonts.lua")
+    def morefonts_lua():
+        return serve_lua("/app/computercraft/morefonts.lua")
+
+    @app.get("/fonts/<name>")
+    def font_file(name):
+        # Names are static files in computercraft/fonts/; reject anything that
+        # isn't a bare alphanumeric/-/_ token so the path can't escape the dir.
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", name):
+            return jsonify({"error": "invalid font name"}), 400
+        try:
+            with open(f"/app/computercraft/fonts/{name}") as f:
+                return Response(f.read(), mimetype="text/plain; charset=utf-8")
+        except FileNotFoundError:
+            return jsonify({"error": "font not found"}), 404
+
     return app
 
 

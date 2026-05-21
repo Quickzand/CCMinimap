@@ -385,6 +385,26 @@ local function cancelSettings()
   end
 end
 
+-- Bitmap font for callsigns drawn next to player markers. 3x3-Mono is the
+-- smallest font in the morefonts pack (4x3 sub-pixels per glyph); a 3-char
+-- callsign fits in ~6-7 cells x 1 row -- same vertical footprint as the old
+-- name-as-text label but narrower. Off-pixels in each touched cell still take
+-- the chosen bg colour (no terrain transparency), so the label still appears
+-- against a black panel -- just a smaller panel than before.
+local mf, callsignFont
+do
+  local ok, m = pcall(dofile, "morefonts.lua")
+  if ok and type(m) == "table" then
+    mf = m
+    local ok2, font = pcall(mf.loadFont, "fonts/3x3-Mono")
+    if ok2 then callsignFont = font end
+  end
+end
+
+local function callsign(name)
+  return (name or "?"):sub(1, 3):upper()
+end
+
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
 local PLAYER_MARKER = { 0x2E, 0x1D }
 
@@ -935,20 +955,34 @@ local function overlayWaypoints(cx, cz, mapH)
 end
 
 local function overlayMarkerLabels(cx, cz, mapH)
-  -- Draw name next to every visible player marker
+  -- Draw a 3-char callsign next to every visible player marker (mf path);
+  -- fall back to the old 9-char ASCII label if morefonts didn't load.
   for _, p in ipairs(state.players or {}) do
     if p.name ~= PLAYER_NAME and p.position then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
       if row >= 1 and row <= mapH then
-        local name = p.name:sub(1, 9)
-        local lx = col + 2
-        if lx + #name - 1 > width then lx = math.max(1, col - #name - 1) end
-        if lx >= 1 then
-          local hexColor = colorForPlayer(p.uuid or p.name or "?")
-          monitor.setCursorPos(lx, row)
-          monitor.setTextColor(HEX_TO_COLOR[hexColor] or colors.cyan)
-          monitor.setBackgroundColor(colors.black)
-          monitor.write(name:sub(1, math.max(0, width - lx + 1)))
+        local hexColor = colorForPlayer(p.uuid or p.name or "?")
+        if mf and callsignFont then
+          local tag = callsign(p.name)
+          local subW = mf.calculateTextSize(tag, { font = callsignFont, condense = true })
+          local cellW = math.max(1, math.ceil(subW / 2))
+          local lx = col + 2
+          if lx + cellW - 1 > width then lx = math.max(1, col - cellW - 1) end
+          if lx >= 1 then
+            monitor.setTextColor(HEX_TO_COLOR[hexColor] or colors.cyan)
+            monitor.setBackgroundColor(colors.black)
+            mf.writeOn(monitor, tag, lx, row, { font = callsignFont, condense = true })
+          end
+        else
+          local name = p.name:sub(1, 9)
+          local lx = col + 2
+          if lx + #name - 1 > width then lx = math.max(1, col - #name - 1) end
+          if lx >= 1 then
+            monitor.setCursorPos(lx, row)
+            monitor.setTextColor(HEX_TO_COLOR[hexColor] or colors.cyan)
+            monitor.setBackgroundColor(colors.black)
+            monitor.write(name:sub(1, math.max(0, width - lx + 1)))
+          end
         end
       end
     end
