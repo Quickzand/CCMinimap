@@ -250,6 +250,8 @@ def create_app() -> Flask:
         "showAltitudeTape",
         "maxAltitude",
         "airshipName",     # must match ship's value to discover it
+        "labelMode",
+        "callsignLen",
         # Pocket holds the password in plaintext (its threat model permits it);
         # the ship stores only the SHA-256 hash and verifies on receive.
         "controlSecret",

@@ -118,6 +118,8 @@ if not fs.exists(CONFIG_FILE) then
   "landRampSeconds": 2.0,
   "playerName": "",
   "airshipName": "main",
+  "labelMode": "always",
+  "callsignLen": 4,
   "controlSecret": "",
   "controlSecretHash": "",
   "authVersion": 1
@@ -140,6 +142,17 @@ local NEEDLE_LENGTH_SUB = tonumber(cfg.needleLength) or 5
 if type(cfg.playerName) == "string" and cfg.playerName ~= "" then
   PLAYER_NAME = cfg.playerName
 end
+
+local LABEL_MODE_VALUES = { "always", "selected", "off" }
+local function isLabelMode(v)
+  for _, x in ipairs(LABEL_MODE_VALUES) do if x == v then return true end end
+  return false
+end
+local LABEL_MODE = (type(cfg.labelMode) == "string" and isLabelMode(cfg.labelMode))
+                   and cfg.labelMode or "always"
+local CALLSIGN_LEN = tonumber(cfg.callsignLen) or 4
+if CALLSIGN_LEN < 1 then CALLSIGN_LEN = 1 end
+if CALLSIGN_LEN > 16 then CALLSIGN_LEN = 16 end
 -- Pairing: AIRSHIP_NAME makes the rednet hostname unique per ship, so a
 -- pocket only discovers its own ship.
 --
@@ -349,6 +362,8 @@ local SETTINGS = {
   { name = "Hover Brn",  cfgKey = "hoverBurnerLevel",          get = function() return HOVER_BURNER end,   set = function(v) HOVER_BURNER = v end,   step = 1,  min = 0,   max = 15  },
   { name = "Max Speed",  cfgKey = "maxSpeed",                  get = function() return MAX_SPEED end,      set = function(v) MAX_SPEED = v end,      step = 1,  min = 1,   max = 20  },
   { name = "Max Alt",    cfgKey = "maxAltitude",               get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
+  { name = "Labels",     cfgKey = "labelMode",                 get = function() return LABEL_MODE end,     set = function(v) LABEL_MODE = v end,     values = LABEL_MODE_VALUES },
+  { name = "Callsign",   cfgKey = "callsignLen",               get = function() return CALLSIGN_LEN end,   set = function(v) CALLSIGN_LEN = v end,   step = 1,  min = 1,   max = 16  },
 }
 
 -- Last-persisted snapshot for the Cancel button. Captured at boot from the
@@ -934,26 +949,83 @@ local function overlayWaypoints(cx, cz, mapH)
   end
 end
 
+-- Per-cell luminance classification for the server-pushed MAP_PALETTE (see
+-- server/cc_palette.py). Labels are blit per character with the underlying
+-- terrain cell's bg color preserved; this table picks whether a fg color
+-- (or a black/white fallback) reads against that bg.
+local BG_IS_LIGHT = {
+  ["0"] = true,  -- snow
+  ["1"] = true,  -- sand
+  ["2"] = false, -- lava (medium-dark)
+  ["3"] = true,  -- shoal
+  ["4"] = true,  -- plains
+  ["5"] = false, -- forest
+  ["6"] = false, -- canopy
+  ["7"] = false, -- darkstone
+  ["8"] = true,  -- stone (mid)
+  ["9"] = false, -- ocean
+  ["a"] = false, -- midwater
+  ["b"] = false, -- water
+  ["c"] = false, -- dirt
+  ["d"] = true,  -- leaf
+  ["e"] = false, -- brick
+  ["f"] = false, -- void
+}
+
+-- Draw text on top of the cached map, sampling each underlying cell's bg so
+-- the text "sits on" the terrain instead of a solid black bar. If preferredFg
+-- is supplied and contrasts with the cell, it is used; otherwise we fall back
+-- to black or white per cell based on the bg's luminance. Cells with no tile
+-- loaded yet (getCell -> nil) fall back to a black bg so the label is still
+-- legible during pan.
+local function blitLabelOverMap(text, col, row, mapH, preferredFg)
+  if row < 1 or row > mapH then return end
+  local mcx, mcz = mapCenter()
+  local startCol = math.max(1, col)
+  local skip = startCol - col
+  local writeLen = math.min(#text - skip, width - startCol + 1)
+  if writeLen <= 0 then return end
+  local textChars, fgChars, bgChars = {}, {}, {}
+  for i = 1, writeLen do
+    local _, _, bg = getCell(startCol + i - 1, row, mapH, mcx, mcz)
+    local bgChar = bg or "f"
+    local fgChar
+    if preferredFg and BG_IS_LIGHT[preferredFg] ~= nil
+       and BG_IS_LIGHT[bgChar] ~= nil
+       and BG_IS_LIGHT[preferredFg] ~= BG_IS_LIGHT[bgChar] then
+      fgChar = preferredFg
+    else
+      fgChar = BG_IS_LIGHT[bgChar] and "f" or "0"
+    end
+    textChars[i] = text:sub(skip + i, skip + i)
+    fgChars[i] = fgChar
+    bgChars[i] = bgChar
+  end
+  monitor.setCursorPos(startCol, row)
+  monitor.blit(table.concat(textChars), table.concat(fgChars), table.concat(bgChars))
+end
+
 local function overlayMarkerLabels(cx, cz, mapH)
-  -- Draw name next to every visible player marker
+  if LABEL_MODE == "off" then return end
+  local selectedOnly = (LABEL_MODE == "selected")
+  -- Player names
   for _, p in ipairs(state.players or {}) do
-    if p.name ~= PLAYER_NAME and p.position then
+    if p.name ~= PLAYER_NAME and p.position
+       and (not selectedOnly or (state.target and state.target.kind == "player" and state.target.name == p.name)) then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
       if row >= 1 and row <= mapH then
-        local name = p.name:sub(1, 9)
+        local name = p.name:sub(1, CALLSIGN_LEN)
         local lx = col + 2
         if lx + #name - 1 > width then lx = math.max(1, col - #name - 1) end
         if lx >= 1 then
           local hexColor = colorForPlayer(p.uuid or p.name or "?")
-          monitor.setCursorPos(lx, row)
-          monitor.setTextColor(HEX_TO_COLOR[hexColor] or colors.cyan)
-          monitor.setBackgroundColor(colors.black)
-          monitor.write(name:sub(1, math.max(0, width - lx + 1)))
+          blitLabelOverMap(name, lx, row, mapH, hexColor)
         end
       end
     end
   end
-  -- Draw name next to the selected target (waypoint or player already covered above)
+  -- Selected waypoint name (only one can be selected; "always" mode still
+  -- only labels the selected waypoint, matching original behavior)
   if state.target and state.target.name and state.target.kind == "waypoint" then
     local col, row = worldToCell(state.target.x, state.target.z, cx, cz, mapH)
     if row >= 1 and row <= mapH then
@@ -961,10 +1033,7 @@ local function overlayMarkerLabels(cx, cz, mapH)
       local lx = col + 2
       if lx + #name - 1 > width then lx = math.max(1, col - #name - 1) end
       if lx >= 1 then
-        monitor.setCursorPos(lx, row)
-        monitor.setTextColor(HEX_TO_COLOR[state.target.color] or colors.yellow)
-        monitor.setBackgroundColor(colors.black)
-        monitor.write(name:sub(1, math.max(0, width - lx + 1)))
+        blitLabelOverMap(name, lx, row, mapH, state.target.color)
       end
     end
   end
@@ -975,20 +1044,15 @@ local function overlayPin(cx, cz, mapH)
   local col, row = worldToCell(state.target.x, state.target.z, cx, cz, mapH)
   if row < 1 or row > mapH then return end
   local mc = math.max(1, math.min(width - 2, col))
-  -- Draw [+] in orange as plain text over the blit map
-  monitor.setCursorPos(mc, row)
-  monitor.setTextColor(colors.orange)
-  monitor.setBackgroundColor(colors.black)
-  monitor.write(("[+]"):sub(1, width - mc + 1))
-  -- Label to the right (or left if near edge)
+  -- [+] keeps orange identity when contrast allows; falls back to black/white
+  -- when the underlying terrain is itself a light tone (e.g. sand/snow).
+  blitLabelOverMap("[+]", mc, row, mapH, "1")
+  if LABEL_MODE == "off" then return end
   local name = (state.target.name or "Pin"):sub(1, 8)
   local lx = mc + 3
   if lx + #name - 1 > width then lx = math.max(1, mc - #name - 1) end
   if lx >= 1 and lx <= width then
-    monitor.setCursorPos(lx, row)
-    monitor.setTextColor(colors.orange)
-    monitor.setBackgroundColor(colors.black)
-    monitor.write(name:sub(1, width - lx + 1))
+    blitLabelOverMap(name, lx, row, mapH, "1")
   end
 end
 
@@ -2511,11 +2575,27 @@ local function applyCommand(cmd)
     state.settingIdx = math.min(#SETTINGS, state.settingIdx + 1)
   elseif id == "setting_inc" then
     local s = SETTINGS[cmd.idx or state.settingIdx]
-    if s then s.set(math.min(s.max, s.get() + s.step)) end
+    if s then
+      if s.values then
+        local cur, idx = s.get(), 1
+        for i, v in ipairs(s.values) do if v == cur then idx = i; break end end
+        s.set(s.values[(idx % #s.values) + 1])
+      else
+        s.set(math.min(s.max, s.get() + s.step))
+      end
+    end
     if state.screen == "settings" then fullRedraw() end
   elseif id == "setting_dec" then
     local s = SETTINGS[cmd.idx or state.settingIdx]
-    if s then s.set(math.max(s.min, s.get() - s.step)) end
+    if s then
+      if s.values then
+        local cur, idx = s.get(), 1
+        for i, v in ipairs(s.values) do if v == cur then idx = i; break end end
+        s.set(s.values[((idx - 2) % #s.values) + 1])
+      else
+        s.set(math.max(s.min, s.get() - s.step))
+      end
+    end
     if state.screen == "settings" then fullRedraw() end
   elseif id == "setting_save" then
     saveSettings()
