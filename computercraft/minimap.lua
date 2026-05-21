@@ -455,7 +455,7 @@ local state = {
   screen = "map",
   wpScroll = 0,
   settingIdx = 1,
-  pinLock = false,     -- when true, map taps don't drop a pin (prevents fat-finger overwrite of current target)
+  pinArmed = false,    -- false (default): map taps don't drop a pin; true: next tap places a pin then auto-disarms
   customControls = {}, -- map: custom control name -> active bool
   status = "starting",
   running = true,
@@ -1951,8 +1951,8 @@ local function drawOsd(x, y, z)
     end
     -- PIN lock: yellow bg when active blocks tap-to-pin so the current
     -- target can't be accidentally overwritten by a stray map tap.
-    local pinBg = state.pinLock and colors.yellow or colors.lightGray
-    drawButton("pin_lock_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
+    local pinBg = state.pinArmed and colors.yellow or colors.lightGray
+    drawButton("pin_arm_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
     -- Full CTR button only on monitor (pocket already has the R slot above).
     if not IS_POCKET and panned then
       drawButton("recenter", col, btnRow, " CTR ", colors.black, colors.cyan); col = col + 5
@@ -2537,8 +2537,8 @@ local function applyCommand(cmd)
   elseif id == "screen_controls"  then state.screen = "controls";  fullRedraw()
   elseif id == "screen_settings"  then state.screen = "settings";  fullRedraw()
 
-  elseif id == "pin_lock_toggle" then
-    state.pinLock = not state.pinLock
+  elseif id == "pin_arm_toggle" then
+    state.pinArmed = not state.pinArmed
 
   elseif id == "recenter" then
     state.mapOffsetX = 0
@@ -2636,7 +2636,7 @@ local LOCAL_CMDS = {
   screen_map=true, screen_waypoints=true, screen_controls=true, screen_settings=true,
   wp_scroll_up=true, wp_scroll_down=true,
   setting_prev=true, setting_next=true,
-  pin_lock_toggle=true,
+  pin_arm_toggle=true,
   recenter=true,
   zoom_in=true, zoom_out=true, lod=true,
 }
@@ -2680,7 +2680,7 @@ state._commitTap = function()
   state.pendingMapTap  = nil
   state.pendingTapTimer = nil
   if not tap then return end
-  if state.screen == "map" and not state.pinLock
+  if state.screen == "map" and state.pinArmed
      and state.lastPos and state.hasMap and tap.y <= mapHeight() then
     local cx, cz = mapCenter()
     local wx, wz = cellToWorld(tap.x, tap.y, cx, cz, mapHeight())
@@ -2694,6 +2694,7 @@ state._commitTap = function()
         color = "e",
       },
     })
+    state.pinArmed = false
   end
 end
 
@@ -2757,8 +2758,9 @@ local function handleTouch(evtName, side, x, y)
       return
     end
   end
-  -- Map tap: place a pin at the tapped world location (unless PIN lock is on).
-  if state.screen == "map" and not state.pinLock
+  -- Map tap: place a pin at the tapped world location (only when armed via
+  -- the PIN button; auto-disarms after placement).
+  if state.screen == "map" and state.pinArmed
      and state.lastPos and state.hasMap and y <= mapHeight() then
     local cx, cz = mapCenter()
     local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
@@ -2772,6 +2774,7 @@ local function handleTouch(evtName, side, x, y)
         color = "e",
       },
     })
+    state.pinArmed = false
   end
 end
 
