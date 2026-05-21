@@ -452,6 +452,13 @@ local state = {
   tileLod = nil,     -- mismatch with current values invalidates the grid.
   tileW = nil,
   tileH = nil,
+  -- Tile (0, 0) is centered on (tileOriginX, tileOriginZ). The origin is
+  -- re-anchored to the current viewport centre whenever the grid is wiped
+  -- (zoom/resize) so the user's view fits inside the centre tile right after
+  -- zoom; without this, ship near a world-tile edge would see a partial
+  -- viewport until neighbours load.
+  tileOriginX = 0,
+  tileOriginZ = 0,
   lastPos = nil,
   lastError = nil,
   mapOffsetX = 0,   -- world-unit pan offset from ship position
@@ -613,15 +620,17 @@ local function tileWorldDim(mapH)
   return width * bX, mapH * bY, bX, bY
 end
 
--- Cells in tile (i, j) have centres at i*tileWB + (c - width/2)*bX for
--- c in [1, width]. The tile boundary therefore sits half a cell past
--- i*tileWB + tileWB/2 -- naive `floor(wx/tileWB + 0.5)` puts boundary cells
--- in the wrong tile and produces black lines between tiles. Shift by half
--- a cell to align tile boundaries with the half-cell-offset cell grid.
+-- Cells in tile (i, j) have centres at (origin + i*tileWB) + (c - width/2)*bX
+-- for c in [1, width]. Shift by half a cell so tile boundaries align with
+-- the half-cell-offset cell grid (without this, boundary cells render as
+-- black columns/rows). The origin is reset to the viewport centre on every
+-- grid wipe (zoom/resize), so the user's current view sits inside tile (0,0).
 local function tileIndexForWorld(wx, wz, mapH)
   local tileWB, tileHB, bX, bY = tileWorldDim(mapH)
-  return math.floor((wx + (tileWB - bX) / 2) / tileWB),
-         math.floor((wz + (tileHB - bY) / 2) / tileHB)
+  local ox = state.tileOriginX or 0
+  local oz = state.tileOriginZ or 0
+  return math.floor((wx - ox + (tileWB - bX) / 2) / tileWB),
+         math.floor((wz - oz + (tileHB - bY) / 2) / tileHB)
 end
 
 -- Returns (packed_byte, fg_char, bg_char) for the cell at screen (col, row),
@@ -634,12 +643,14 @@ local function getCell(col, row, mapH, mcx, mcz)
   local tileHB = mapH * bY
   local wx = mcx + (col - width / 2) * bX
   local wz = mcz + (row - mapH / 2) * bY
-  local ti = math.floor((wx + (tileWB - bX) / 2) / tileWB)
-  local tj = math.floor((wz + (tileHB - bY) / 2) / tileHB)
+  local ox = state.tileOriginX or 0
+  local oz = state.tileOriginZ or 0
+  local ti = math.floor((wx - ox + (tileWB - bX) / 2) / tileWB)
+  local tj = math.floor((wz - oz + (tileHB - bY) / 2) / tileHB)
   local tile = state.tiles[tileKey(ti, tj)]
   if not tile then return nil end
-  local tc = math.floor((wx - ti * tileWB) / bX + width / 2 + 0.5)
-  local tr = math.floor((wz - tj * tileHB) / bY + mapH / 2 + 0.5)
+  local tc = math.floor((wx - ox - ti * tileWB) / bX + width / 2 + 0.5)
+  local tr = math.floor((wz - oz - tj * tileHB) / bY + mapH / 2 + 0.5)
   local row_text = tile.text[tr]
   if not row_text or tc < 1 or tc > #row_text then return nil end
   return string.byte(row_text, tc), tile.fg[tr]:sub(tc, tc), tile.bg[tr]:sub(tc, tc)
@@ -661,18 +672,20 @@ local function drawCachedMap(mapH)
   local tileHB = mapH * bY
   local halfDxX = (tileWB - bX) / 2
   local halfDxY = (tileHB - bY) / 2
+  local ox = state.tileOriginX or 0
+  local oz = state.tileOriginZ or 0
   for r = 1, mapH do
     local wz = mcz + (r - mapH / 2) * bY
-    local tj = math.floor((wz + halfDxY) / tileHB)
-    local tr = math.floor((wz - tj * tileHB) / bY + mapH / 2 + 0.5)
+    local tj = math.floor((wz - oz + halfDxY) / tileHB)
+    local tr = math.floor((wz - oz - tj * tileHB) / bY + mapH / 2 + 0.5)
     local textRow, fgRow, bgRow = {}, {}, {}
     for c = 1, width do
       local wx = mcx + (c - width / 2) * bX
-      local ti = math.floor((wx + halfDxX) / tileWB)
+      local ti = math.floor((wx - ox + halfDxX) / tileWB)
       local tile = state.tiles[tileKey(ti, tj)]
       local row_text = tile and tile.text[tr]
       if row_text then
-        local tc = math.floor((wx - ti * tileWB) / bX + width / 2 + 0.5)
+        local tc = math.floor((wx - ox - ti * tileWB) / bX + width / 2 + 0.5)
         if tc >= 1 and tc <= #row_text then
           textRow[c] = row_text:sub(tc, tc)
           fgRow[c]   = tile.fg[tr]:sub(tc, tc)
@@ -2029,8 +2042,8 @@ end
 -- world-aligned to a stale grid.
 local function fetchTile(ti, tj, fetchBpp, fetchLod, mapH)
   local tileWB, tileHB = tileWorldDim(mapH)
-  local cx = ti * tileWB
-  local cz = tj * tileHB
+  local cx = (state.tileOriginX or 0) + ti * tileWB
+  local cz = (state.tileOriginZ or 0) + tj * tileHB
   local data, err = httpGetJson(buildUrl(cx, cz))
   if data and data.text
      and state.bpp == fetchBpp and state.lod == fetchLod
@@ -2059,6 +2072,7 @@ local function mapTick()
   local mapH = mapHeight()
   -- Grid invalidation: any zoom/resize wipes tiles. They map to different
   -- world rects under new bpp, so reusing them would draw garbage.
+  local mcx, mcz = mapCenter()
   if state.tileBpp ~= state.bpp or state.tileLod ~= state.lod
      or state.tileW ~= width or state.tileH ~= mapH then
     state.tiles = {}
@@ -2067,9 +2081,12 @@ local function mapTick()
     state.tileLod = state.lod
     state.tileW = width
     state.tileH = mapH
+    -- Re-anchor tile (0, 0) on the current viewport so the user's view sits
+    -- inside the centre tile right after zoom (no partial neighbour tiles).
+    state.tileOriginX = mcx
+    state.tileOriginZ = mcz
   end
 
-  local mcx, mcz = mapCenter()
   local ci, cj = tileIndexForWorld(mcx, mcz, mapH)
 
   -- Evict tiles outside a 5x5 buffer to bound memory.
@@ -2279,6 +2296,7 @@ local function applyCommand(cmd)
     state.engaged = false
     state.autoStatus = ""
     resetLiftIntegrator()
+    os.queueEvent("map_dirty")  -- wake mapLoop so overlayPin renders without waiting for FRAME_INTERVAL
 
   -- ---- CLI commands ---------------------------------------------------------
   -- Each handler is the receiving end of a `ship <cmd>` invocation; see
