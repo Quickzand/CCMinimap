@@ -319,6 +319,9 @@ local GROUND_CHUNK_RADIUS = math.floor(tonumber(cfg.groundSampleChunkRadius) or 
 local VELOCITY_FLIPPED = (cfg.velocityFlipped ~= false)
 local CRUISE_ALT_AGL    = tonumber(cfg.cruiseAltitudeAboveGround) or 50
 local MIN_ALT_AGL       = tonumber(cfg.minAltitudeAboveGround) or 20
+-- AGL held when following a player target. Defaults to MIN_ALT_AGL so the
+-- ship hovers low enough to see the player; tunable on the settings screen.
+local FOLLOW_ALT_AGL    = tonumber(cfg.followAltitudeAboveGround) or MIN_ALT_AGL
 local HOVER_BURNER      = tonumber(cfg.hoverBurnerLevel) or 7
 -- Floor on the PID-commanded burner level. The pure [0,15] clamp lets the
 -- controller drop the burner to 0 when asking for descent, which on heavier
@@ -342,6 +345,7 @@ local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 local SETTINGS = {
   { name = "Cruise AGL", cfgKey = "cruiseAltitudeAboveGround", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
   { name = "Min AGL",    cfgKey = "minAltitudeAboveGround",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
+  { name = "Follow AGL", cfgKey = "followAltitudeAboveGround", get = function() return FOLLOW_ALT_AGL end, set = function(v) FOLLOW_ALT_AGL = v end, step = 5,  min = 5,   max = 200 },
   { name = "Hover Brn",  cfgKey = "hoverBurnerLevel",          get = function() return HOVER_BURNER end,   set = function(v) HOVER_BURNER = v end,   step = 1,  min = 0,   max = 15  },
   { name = "Max Speed",  cfgKey = "maxSpeed",                  get = function() return MAX_SPEED end,      set = function(v) MAX_SPEED = v end,      step = 1,  min = 1,   max = 20  },
   { name = "Max Alt",    cfgKey = "maxAltitude",               get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
@@ -389,6 +393,7 @@ local WAYPOINT_MARKER = { 0x26, 0x19 }
 
 -- Autopilot tunables.
 local ARRIVAL_RADIUS = 15      -- blocks; stop when within this of target
+local FOLLOW_LEAVE_RADIUS = 30 -- blocks; in FOLLOW phase, range above this resumes pursuit (hysteresis vs ARRIVAL_RADIUS)
 local TURN_THRESHOLD = 20      -- degrees; |err| above this = pure turn, no forward
 local FINE_THRESHOLD = 5       -- degrees; |err| above this = forward + correction
 local TRAIL_STEP = 2           -- plot a trail dot every N cells from ship to target
@@ -1378,7 +1383,25 @@ local function updatePhase()
     return
   end
 
+  -- FOLLOW phase: hovering over a player target. Re-enter pursuit if they've
+  -- moved far enough away; otherwise stay put. Don't fall through to LAND.
+  if state.phase == "FOLLOW" then
+    if range > FOLLOW_LEAVE_RADIUS then
+      state.phase = nil  -- re-init below to CLIMB_TO_CRUISE / CRUISE
+    else
+      return
+    end
+  end
+
   if range < ARRIVAL_RADIUS then
+    if state.target.kind == "player" then
+      -- Player targets follow indefinitely: hover here, ignore the LAND/ARRIVED
+      -- paths. The user disengages via STOP or by picking a different target.
+      state.phase = "FOLLOW"
+      state.autoStatus = "FOLLOW"
+      resetLiftIntegrator()  -- fresh integrator for the FOLLOW-altitude hold
+      return
+    end
     if state.altHoldActive or state.aglHoldActive then
       -- An altitude lock is on; hand altitude off to it instead of landing.
       state.engaged = false
@@ -1457,7 +1480,11 @@ local function altitudeController()
       if not state.groundY then return end
       targetAlt = state.groundY + state.aglHoldOffset
     elseif state.engaged and state.groundY then
-      targetAlt = state.groundY + CRUISE_ALT_AGL
+      -- FOLLOW phase holds at the (typically lower) FOLLOW_ALT_AGL so the ship
+      -- hovers close enough to actually see the player. Explicit alt/AGL locks
+      -- above this branch already take precedence.
+      local agl_target = (state.phase == "FOLLOW") and FOLLOW_ALT_AGL or CRUISE_ALT_AGL
+      targetAlt = state.groundY + agl_target
     end
     if not targetAlt then return end
 
@@ -1497,6 +1524,11 @@ local function horizontalController()
   if state.phase == "LAND" then
     setControl("forward", false); setControl("left", false); setControl("right", false)
     state.autoStatus = "LAND"
+    return
+  end
+  if state.phase == "FOLLOW" then
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+    state.autoStatus = "FOLLOW"
     return
   end
   local dx = (state.target.x or 0) - state.lastPos.x
@@ -2663,6 +2695,7 @@ local function stateSnapshot()
     lod           = state.lod,
     cruiseAltAgl    = CRUISE_ALT_AGL,
     minAltAgl       = MIN_ALT_AGL,
+    followAltAgl    = FOLLOW_ALT_AGL,
     hoverBurner     = HOVER_BURNER,
     maxSpeed        = MAX_SPEED,
     maxAlt          = MAX_ALT,
@@ -2770,6 +2803,7 @@ local function rednetLoop()
           -- overwrite the pocket's own zoom level.
           if msg.cruiseAltAgl   then CRUISE_ALT_AGL        = msg.cruiseAltAgl   end
           if msg.minAltAgl      then MIN_ALT_AGL           = msg.minAltAgl      end
+          if msg.followAltAgl   then FOLLOW_ALT_AGL        = msg.followAltAgl   end
           if msg.hoverBurner    then HOVER_BURNER          = msg.hoverBurner    end
           if msg.maxSpeed       then MAX_SPEED             = msg.maxSpeed       end
           if msg.maxAlt         then MAX_ALT               = msg.maxAlt         end
