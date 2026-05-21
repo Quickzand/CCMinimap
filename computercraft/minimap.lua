@@ -2118,10 +2118,14 @@ local function fullRedraw()
       state.lastBurnerLevel = nil
       state.lastTapeCells = {}
       local cx, cz = mapCenter()
+      -- Order must match fastTick so markers/labels never blink off in the
+      -- gap between a fullRedraw (1Hz) and the next fastTick (10Hz). The
+      -- needle paints first; trail/waypoints/players/pin/labels then sit on
+      -- top of it inside its bounding box.
+      overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
       overlayDotTrail(cx, cz, mapH)
       overlayWaypoints(cx, cz, mapH)
       overlayOtherPlayers(cx, cz, mapH)
-      overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
       overlayPin(cx, cz, mapH)
       overlayMarkerLabels(cx, cz, mapH)
       overlayAltitudeTape(mapH)
