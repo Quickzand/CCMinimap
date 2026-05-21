@@ -247,6 +247,7 @@ def create_app() -> Flask:
     # live on the ship and reach the pocket via rednet broadcasts.
     _POCKET_KEYS = {
         "needleLength",
+        "peerNeedleLength",
         "showAltitudeTape",
         "maxAltitude",
         "airshipName",     # must match ship's value to discover it

@@ -47,6 +47,7 @@ if not fs.exists(CONFIG_FILE) then
   f.write([[{
   "headingOffset": 0,
   "needleLength": 5,
+  "peerNeedleLength": 5,
   "channels": {
     "forward": {
       "relay": "redstone_relay_0",
@@ -137,6 +138,7 @@ do
 end
 
 local NEEDLE_LENGTH_SUB = tonumber(cfg.needleLength) or 5
+local PEER_NEEDLE_LEN_SUB = tonumber(cfg.peerNeedleLength) or 5
 -- Multi-user override: cfg.playerName wins over the server-substituted default
 -- so two players sharing one BlueMap server can each suppress their own dot.
 if type(cfg.playerName) == "string" and cfg.playerName ~= "" then
@@ -352,9 +354,6 @@ local CLIMB_DONE_MARGIN = 5    -- blocks below cruise that count as "arrived at 
 local RECOVER_MARGIN    = 10   -- exit STOP_AND_RISE this many blocks above MIN_ALT_AGL
 local LANDED_ALT_MARGIN = 2    -- |alt - groundY| < this and |vy| small = landed
 local LANDED_VY_THRESH  = 0.1
-local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
-local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
-
 local SETTINGS = {
   { name = "Cruise AGL", cfgKey = "cruiseAltitudeAboveGround", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
   { name = "Min AGL",    cfgKey = "minAltitudeAboveGround",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
@@ -364,6 +363,8 @@ local SETTINGS = {
   { name = "Max Alt",    cfgKey = "maxAltitude",               get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
   { name = "Labels",     cfgKey = "labelMode",                 get = function() return LABEL_MODE end,     set = function(v) LABEL_MODE = v end,     values = LABEL_MODE_VALUES },
   { name = "Callsign",   cfgKey = "callsignLen",               get = function() return CALLSIGN_LEN end,   set = function(v) CALLSIGN_LEN = v end,   step = 1,  min = 1,   max = 16  },
+  { name = "Needle Len", cfgKey = "needleLength",              get = function() return NEEDLE_LENGTH_SUB end,   set = function(v) NEEDLE_LENGTH_SUB = v end,   step = 1, min = 2, max = 15 },
+  { name = "Peer Needle",cfgKey = "peerNeedleLength",          get = function() return PEER_NEEDLE_LEN_SUB end, set = function(v) PEER_NEEDLE_LEN_SUB = v end, step = 1, min = 2, max = 10 },
 }
 
 -- Last-persisted snapshot for the Cancel button. Captured at boot from the
@@ -774,21 +775,18 @@ local function overlayCell(col, row, stenBits, color, mapH, override)
   monitor.blit(string.char(new_pattern + 0x80), new_fg, new_bg)
 end
 
-local function overlaySelfTriangle(heading, mapH, cx, cz)
-  local rad = math.rad(heading or 0)
+-- Heading-oriented needle rasterizer used by both the self marker and peer
+-- markers (other players + transponder ships). Parametric so callers can pick
+-- length, colors, and whether painted cells get recorded for next-frame
+-- erase. Cardinals get a 3-sub-pixel cross base; diagonals get a 2-sub-pixel
+-- L. Where needle and base bits collide in the same cell, a single
+-- 2-color blit replaces both -- this is what keeps the marker contiguous;
+-- doing two separate override-blits would have the second wipe the first.
+local function drawNeedle(centerCol, centerRow, headingDeg, lenSub, needleColor, baseColor, mapH, track)
+  if centerCol < 1 or centerCol > width or centerRow < 1 or centerRow > mapH then return nil end
+  local rad = math.rad(headingDeg or 0)
   local dx = math.sin(rad)
-  local dy = -math.cos(rad)  -- compass 0 = N = up = -Y on screen
-
-  -- When panned, ship is no longer at screen center; compute its actual cell.
-  local centerCol, centerRow
-  if state.lastPos and cx ~= nil then
-    centerCol, centerRow = worldToCell(state.lastPos.x, state.lastPos.z, cx, cz, mapH)
-  else
-    centerCol = math.floor(width / 2 + 0.5)
-    centerRow = math.floor(mapH / 2 + 0.5)
-  end
-  -- Don't draw if ship is scrolled off-screen.
-  if centerCol < 1 or centerCol > width or centerRow < 1 or centerRow > mapH then return end
+  local dy = -math.cos(rad)
   local centerSubX = (centerCol - 1) * SUB_W + (SUB_W - 1) / 2
   local centerSubY = (centerRow - 1) * SUB_H + (SUB_H - 1) / 2
 
@@ -805,20 +803,19 @@ local function overlaySelfTriangle(heading, mapH, cx, cz)
 
   -- Walk the needle in fine steps, mark each sub-pixel into a per-cell bitmap.
   local needleCells = {}
-  local steps = NEEDLE_LENGTH_SUB * 5
+  local steps = lenSub * 5
   for i = 0, steps do
     local t = i / steps
-    local sxR = math.floor(centerSubX + dx * NEEDLE_LENGTH_SUB * t + 0.5)
-    local syR = math.floor(centerSubY + dy * NEEDLE_LENGTH_SUB * t + 0.5)
-    lightSub(needleCells, sxR, syR)
+    lightSub(needleCells,
+      math.floor(centerSubX + dx * lenSub * t + 0.5),
+      math.floor(centerSubY + dy * lenSub * t + 0.5))
   end
 
-  -- Dark base mark at the needle root. Snap to 8 octants so cardinals get a
-  -- 3-px cross (perp + behind) and diagonals get a 2-px L (one orthogonal
-  -- pixel behind the base + one diagonally adjacent further behind it).
+  -- Octant-snapped base. All offsets are at distance 1 from center and share
+  -- an edge with it so base+needle is never disconnected.
   local baseSxR = math.floor(centerSubX + 0.5)
   local baseSyR = math.floor(centerSubY + 0.5)
-  local octant = math.floor(((((heading or 0) % 360) + 22.5) % 360) / 45)
+  local octant = math.floor(((((headingDeg or 0) % 360) + 22.5) % 360) / 45)
   local crossOffsets
   if     octant == 0 then crossOffsets = { {-1, 0}, {1, 0}, {0, 1} }   -- N
   elseif octant == 2 then crossOffsets = { {0, -1}, {0, 1}, {-1, 0} }  -- E
@@ -834,52 +831,60 @@ local function overlaySelfTriangle(heading, mapH, cx, cz)
     lightSub(baseCells, baseSxR + o[1], baseSyR + o[2])
   end
 
-  -- Re-blit each cell in the marker area. Cases:
-  --   needle bits AND base bits  -> FG=red, BG=dark. Cell loses terrain bg
-  --     and becomes a small anchor block, but base sub-pixels render as
-  --     intended and the conflict on the centre cell is resolved.
-  --   needle only -> red over the cached map cell bg
-  --   base only   -> dark over the cached map cell bg
-  --   neither     -> restore the cached cell
-  local startCol = centerCol - math.floor(NEEDLE_AREA_W / 2)
-  local startRow = centerRow - math.floor(NEEDLE_AREA_H / 2)
-  for r = 0, NEEDLE_AREA_H - 1 do
-    for c = 0, NEEDLE_AREA_W - 1 do
+  -- Iterate every cell in the marker area and pick a rendering mode:
+  --   needle + base in same cell -> single 2-color blit (no terrain bg here).
+  --   needle only                -> override blit over terrain bg.
+  --   base only                  -> override blit over terrain bg.
+  local areaW = 2 * math.ceil(lenSub / SUB_W) + 1
+  local areaH = 2 * math.ceil(lenSub / SUB_H) + 1
+  local startCol = centerCol - math.floor(areaW / 2)
+  local startRow = centerRow - math.floor(areaH / 2)
+  for r = 0, areaH - 1 do
+    for c = 0, areaW - 1 do
       local col = startCol + c
       local row = startRow + r
       local key = col * 1024 + row
-      local redBits = needleCells[key] or 0
-      local darkBits = bit32.band(baseCells[key] or 0, bit32.bnot(redBits))
-      if redBits ~= 0 and darkBits ~= 0 then
-        -- Forced fg/bg blit (no terrain bg preserved) because needle + base
-        -- collide on the same cell; the center anchor wins both colours.
+      local nb = needleCells[key] or 0
+      local bb = bit32.band(baseCells[key] or 0, bit32.bnot(nb))
+      if nb ~= 0 and bb ~= 0 then
         if col >= 1 and col <= width and row >= 1 and row <= mapH then
-          local pattern, fg, bg = redBits, "2", "7"
+          local pattern, fg, bg = nb, needleColor, baseColor
           if bit32.band(pattern, 0x20) ~= 0 then
             pattern = bit32.bxor(pattern, 0x3F)
             fg, bg = bg, fg
           end
           monitor.setCursorPos(col, row)
           monitor.blit(string.char(pattern + 0x80), fg, bg)
+          if track then state.lastNeedleCells[col * 1024 + row] = true end
+        end
+      elseif nb ~= 0 then
+        overlayCell(col, row, nb, needleColor, mapH, true)
+        if track and col >= 1 and col <= width and row >= 1 and row <= mapH then
           state.lastNeedleCells[col * 1024 + row] = true
         end
-      elseif redBits ~= 0 then
-        overlayCell(col, row, redBits, "2", mapH, true)
-        if col >= 1 and col <= width and row >= 1 and row <= mapH then
-          state.lastNeedleCells[col * 1024 + row] = true
-        end
-      elseif darkBits ~= 0 then
-        overlayCell(col, row, darkBits, "7", mapH, true)
-        if col >= 1 and col <= width and row >= 1 and row <= mapH then
+      elseif bb ~= 0 then
+        overlayCell(col, row, bb, baseColor, mapH, true)
+        if track and col >= 1 and col <= width and row >= 1 and row <= mapH then
           state.lastNeedleCells[col * 1024 + row] = true
         end
       end
-      -- "neither" cells used to blanket-restore terrain so the old needle
-      -- got erased even when off the new needle's path. eraseSelfTriangle
-      -- now does that targeted restore against state.lastNeedleCells, so
-      -- markers/labels can paint underneath the needle without being wiped.
     end
   end
+  return { col1 = startCol, col2 = startCol + areaW - 1, row1 = startRow, row2 = startRow + areaH - 1 }
+end
+
+-- Self marker: red needle with dark-gray base nub. drawNeedle owns the
+-- rasterization; this wrapper just figures out where the ship is on the
+-- (possibly panned) viewport.
+local function overlaySelfTriangle(heading, mapH, cx, cz)
+  local centerCol, centerRow
+  if state.lastPos and cx ~= nil then
+    centerCol, centerRow = worldToCell(state.lastPos.x, state.lastPos.z, cx, cz, mapH)
+  else
+    centerCol = math.floor(width / 2 + 0.5)
+    centerRow = math.floor(mapH / 2 + 0.5)
+  end
+  drawNeedle(centerCol, centerRow, heading, NEEDLE_LENGTH_SUB, "2", "7", mapH, true)
 end
 
 -- Restore the cached terrain in every cell the needle painted last frame.
@@ -949,77 +954,14 @@ local function lightSubPx(map, sxR, syR)
   end
 end
 
--- Small heading-oriented needle for peers (other players and ships). Mirrors
--- the self-needle but shorter (3 sub-pixels vs 5) and with a single-sub-pixel
--- base nub instead of a 3-sub-pixel cross, so peers stay visually distinct
--- from the self marker. Needle paints in the peer's hash color; base nub
--- paints in black. Returns a bbox for hitbox registration.
+-- Peer needle (other players + transponder ships). Delegates to the shared
+-- drawNeedle with the peer's hash color and a black base. Length comes from
+-- PEER_NEEDLE_LEN_SUB so the user can tune peer vs self size in cfg.
 local overlayMarkerDisc   -- forward decl: the needle falls back to disc when
                           -- headingDeg is nil (headingless beacons).
-local function overlayMarkerNeedle(col, row, headingDeg, color, mapH)
-  if headingDeg == nil then return overlayMarkerDisc(col, row, color, mapH) end
-  local rad = math.rad(headingDeg)
-  local dx = math.sin(rad)
-  local dy = -math.cos(rad)
-  local cSubX = (col - 1) * SUB_W + (SUB_W - 1) / 2
-  local cSubY = (row - 1) * SUB_H + (SUB_H - 1) / 2
-
-  local NEEDLE_LEN_SUB = 3
-  local needle, base = {}, {}
-  -- Walk the needle from center outward, sampling densely. ~20 samples per
-  -- sub-pixel guarantees we land on every transition sub-pixel along the path
-  -- so non-cardinal headings don't show a diagonal gap (the previous 4x
-  -- sampling missed intermediate sub-pixels where x and y rolled over at
-  -- nearly the same t).
-  local steps = NEEDLE_LEN_SUB * 20
-  for i = 0, steps do
-    local t = i / steps
-    lightSubPx(needle,
-      math.floor(cSubX + dx * NEEDLE_LEN_SUB * t + 0.5),
-      math.floor(cSubY + dy * NEEDLE_LEN_SUB * t + 0.5))
-  end
-  -- Single sub-pixel base nub one step behind center, snapped to the dominant
-  -- axis of the back-heading. The naive "-1 along heading" lands diagonally
-  -- behind center for non-cardinal headings, sharing only a corner with the
-  -- needle start (=visible gap). Axis-snapping guarantees the base shares an
-  -- edge with center so the marker reads as one contiguous shape.
-  local backX, backY = -dx, -dy
-  local baseDx, baseDy
-  if math.abs(backX) >= math.abs(backY) then
-    baseDx, baseDy = (backX > 0) and 1 or -1, 0
-  else
-    baseDx, baseDy = 0, (backY > 0) and 1 or -1
-  end
-  lightSubPx(base,
-    math.floor(cSubX + baseDx + 0.5),
-    math.floor(cSubY + baseDy + 0.5))
-
-  -- Blit. Where the needle and base land in the same cell on the same sub-pixel,
-  -- the needle wins (same precedence as overlaySelfTriangle uses for its anchor).
-  local minC, maxC, minR, maxR = math.huge, -math.huge, math.huge, -math.huge
-  local function trackBbox(cc, rr)
-    if cc < minC then minC = cc end
-    if cc > maxC then maxC = cc end
-    if rr < minR then minR = rr end
-    if rr > maxR then maxR = rr end
-  end
-  for key, bits in pairs(needle) do
-    local cc = math.floor(key / 1024)
-    local rr = key - cc * 1024
-    overlayCell(cc, rr, bits, color, mapH, true)
-    base[key] = bit32.band(base[key] or 0, bit32.bnot(bits))
-    trackBbox(cc, rr)
-  end
-  for key, bits in pairs(base) do
-    if bits ~= 0 then
-      local cc = math.floor(key / 1024)
-      local rr = key - cc * 1024
-      overlayCell(cc, rr, bits, "f", mapH, true)   -- black base nub
-      trackBbox(cc, rr)
-    end
-  end
-  if minC == math.huge then return nil end
-  return { col1 = minC, col2 = maxC, row1 = minR, row2 = maxR }
+local function overlayMarkerNeedle(centerCol, centerRow, headingDeg, color, mapH)
+  if headingDeg == nil then return overlayMarkerDisc(centerCol, centerRow, color, mapH) end
+  return drawNeedle(centerCol, centerRow, headingDeg, PEER_NEEDLE_LEN_SUB, color, "f", mapH, false)
 end
 
 -- Hollow ring marker: 8 sub-pixels arranged around the cell center, hollow
