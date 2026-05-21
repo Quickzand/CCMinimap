@@ -1818,13 +1818,22 @@ local function drawOsd(x, y, z)
   if state.screen == "map" then
     drawButton("zoom_out", col, btnRow, " - "); col = col + 3
     drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
-    drawButton("lod",      col, btnRow, " L" .. state.lod); col = col + 3
+    local panned = (state.mapOffsetX or 0) ~= 0 or (state.mapOffsetZ or 0) ~= 0
+    if IS_POCKET then
+      -- Pocket bar is too narrow for L2 + PIN + CTR; the L2 slot becomes a
+      -- recenter button instead. Always drawn so the bar layout stays stable;
+      -- cyan when there's a pan to undo, lightGray (inert-looking) when not.
+      local rBg = panned and colors.cyan or colors.lightGray
+      drawButton("recenter", col, btnRow, " R ", colors.black, rBg); col = col + 3
+    else
+      drawButton("lod", col, btnRow, " L" .. state.lod); col = col + 3
+    end
     -- PIN lock: yellow bg when active blocks tap-to-pin so the current
     -- target can't be accidentally overwritten by a stray map tap.
     local pinBg = state.pinLock and colors.yellow or colors.lightGray
     drawButton("pin_lock_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
-    -- CTR button: only visible when map is panned away from ship position.
-    if (state.mapOffsetX or 0) ~= 0 or (state.mapOffsetZ or 0) ~= 0 then
+    -- Full CTR button only on monitor (pocket already has the R slot above).
+    if not IS_POCKET and panned then
       drawButton("recenter", col, btnRow, " CTR ", colors.black, colors.cyan); col = col + 5
     end
     if state.target then
