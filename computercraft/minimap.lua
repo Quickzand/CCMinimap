@@ -2239,7 +2239,11 @@ local function maybeFetchSidecar()
   if p and p.players then state.players = p.players end
   local w = httpGetJson(SERVER .. "/waypoints")
   if w then state.waypoints = w end
-  if state.lastPos then
+  -- /height is a ship-only fetch. The pocket gets state.groundY from the
+  -- ship's rednet broadcast (see rednetLoop). Letting both run causes
+  -- state.groundY to oscillate as the two writers sample different chunk
+  -- windows on different schedules.
+  if not IS_POCKET and state.lastPos then
     local url = string.format("%s/height?x=%s&z=%s&r=%d",
       SERVER, urlencode(state.lastPos.x), urlencode(state.lastPos.z), GROUND_CHUNK_RADIUS)
     local h = httpGetJson(url)
