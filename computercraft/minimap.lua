@@ -2298,6 +2298,11 @@ local function fastTick()
       if not IS_POCKET then overlaySpeedDial(mapH) end
       local fcx, fcz = mapCenter()
       overlaySelfTriangle(state.shipHeading, mapH, fcx, fcz)
+      -- Re-stamp labels after the needle redraw so names inside the needle
+      -- bounding box don't flicker off between fullRedraws (1Hz) while
+      -- fastTick wipes/redraws the needle area at 10Hz.
+      overlayPin(fcx, fcz, mapH)
+      overlayMarkerLabels(fcx, fcz, mapH)
     elseif state.screen == "controls" then
       drawControlsScreen(mapH)
     end
