@@ -1047,12 +1047,11 @@ overlayOtherShips = function(cx, cz, mapH, restampOnly)
 end
 
 overlayWaypoints = function(cx, cz, mapH, restampOnly)
-  -- All waypoints share one ring color so they stand out against any biome.
-  -- Slot "2" is the map palette's lava red-orange -- the warmest color in the
-  -- palette and the most distinct from common terrain (green / blue / sand /
-  -- stone). Selected waypoints flip to "0" (snow white) which is what we
-  -- already had and reads well. We ignore wp.color for the ring; the hitbox
-  -- still carries it so the selected label keeps its per-waypoint accent.
+  -- Ring color is one fixed high-contrast slot so waypoints stand out against
+  -- any biome. Slot "2" (lava red-orange) is the warmest in the map palette
+  -- and distinct from common terrain (green / blue / sand / stone). Selected
+  -- flips to "0" (snow white). Per-waypoint identity comes from the letter
+  -- badge below, not the ring color.
   local DEFAULT_RING = "2"
   local SELECTED_RING = "0"
   for _, wp in ipairs(state.waypoints or {}) do
@@ -1061,6 +1060,22 @@ overlayWaypoints = function(cx, cz, mapH, restampOnly)
       local labelColor = paletteHexFor(wp.color)
       local ringColor = isSelected("waypoint", wp.name) and SELECTED_RING or DEFAULT_RING
       local bbox = overlayMarkerDisc(col, row, ringColor, mapH)
+      -- Letter badge: first char of wp.name in the waypoint's accent color,
+      -- placed one cell off the ring's right edge. Lets you tell waypoints
+      -- apart at a glance without selecting each one. The selected waypoint
+      -- also gets its full name via overlayMarkerLabels, which paints over
+      -- this letter -- harmless since they share the same first character.
+      -- LABEL_MODE="off" suppresses this so the minimal-map setting stays
+      -- minimal (matches how overlayPin suppresses its label).
+      if LABEL_MODE ~= "off" and type(wp.name) == "string" and #wp.name > 0
+         and row >= 1 and row <= mapH then
+        local letter = wp.name:sub(1, 1):upper()
+        local lx = col + 2
+        if lx > width then lx = math.max(1, col - 2) end
+        if lx >= 1 and lx <= width then
+          blitLabelOverMap(letter, lx, row, mapH, labelColor)
+        end
+      end
       if not restampOnly then
         registerHitbox(bbox, "waypoint", wp.name, wp.x, wp.z, labelColor)
       end
@@ -2562,7 +2577,7 @@ local function applyCommand(cmd)
       state.aglHoldOffset = nil
     elseif state.altitude and state.groundY then
       state.aglHoldActive = true
-      state.aglHoldOffset = math.max(0, state.altitude - state.groundY)
+      state.aglHoldOffset = state.altitude - state.groundY
       state.altHoldActive = false
       state.altHoldTarget = nil
     end
@@ -2683,7 +2698,7 @@ local function applyCommand(cmd)
     if type(cmd.offset) == "number" then
       if state.groundY then
         state.aglHoldActive = true
-        state.aglHoldOffset = math.max(0, cmd.offset)
+        state.aglHoldOffset = cmd.offset
         state.altHoldActive = false
         state.altHoldTarget = nil
         state.burnerTarget = nil
@@ -2693,7 +2708,7 @@ local function applyCommand(cmd)
       state.aglHoldOffset = nil
     elseif state.altitude and state.groundY then
       state.aglHoldActive = true
-      state.aglHoldOffset = math.max(0, state.altitude - state.groundY)
+      state.aglHoldOffset = state.altitude - state.groundY
       state.altHoldActive = false
       state.altHoldTarget = nil
       state.burnerTarget = nil
@@ -2756,7 +2771,7 @@ local function applyCommand(cmd)
       state.altHoldTarget = state.altHoldTarget - step
       resetLiftIntegrator()
     elseif state.aglHoldActive and state.aglHoldOffset then
-      state.aglHoldOffset = math.max(0, state.aglHoldOffset - step)
+      state.aglHoldOffset = state.aglHoldOffset - step
       resetLiftIntegrator()
     else
       local lvl = math.max(0, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) - step)
