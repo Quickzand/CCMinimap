@@ -2741,7 +2741,14 @@ local function rednetLoop()
           state.velocity      = msg.velocity
           state.vy            = msg.vy
           state.groundY       = msg.groundY
+          -- Detect target identity change so the pocket redraws immediately
+          -- when the ship confirms a tap-placed pin (without this the new
+          -- pin marker only appears at the next mapTick).
+          local _ot, _nt = state.target, msg.target
+          local _targetChanged = (_ot == nil) ~= (_nt == nil)
+              or (_ot and _nt and (_ot.x ~= _nt.x or _ot.z ~= _nt.z or _ot.name ~= _nt.name or _ot.kind ~= _nt.kind))
           state.target        = msg.target
+          if _targetChanged then os.queueEvent("map_dirty") end
           state.engaged       = msg.engaged
           state.altHoldActive = msg.altHoldActive
           state.altHoldTarget = msg.altHoldTarget
