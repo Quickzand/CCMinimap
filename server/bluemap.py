@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -69,12 +70,18 @@ class LowresSettings:
     lod_count: int
 
 
+_TILE_MEM_MAX = 128   # max decoded tiles kept in memory (~2 MB each at LOD1)
+_TILE_MEM_TTL = 60.0  # seconds before a memory-cached tile is considered stale
+
+
 class BlueMapClient:
     def __init__(self, config: BlueMapConfig):
         self.config = config
         self.session = requests.Session()
         self.config.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lowres: LowresSettings | None = None
+        # In-memory tile cache: key → (timestamp, Image). OrderedDict for LRU eviction.
+        self._tile_mem: OrderedDict[tuple, tuple[float, Image.Image]] = OrderedDict()
 
     @property
     def map_root(self) -> str:
@@ -141,17 +148,27 @@ class BlueMapClient:
         if lod < 1 or lod > lowres.lod_count:
             raise BlueMapError(f"LOD must be between 1 and {lowres.lod_count}")
 
+        mem_key = (lod, tile_x, tile_z)
+        now = time.time()
+
+        # Hot memory cache: skip disk and network entirely for recently decoded tiles.
+        if mem_key in self._tile_mem:
+            ts, img = self._tile_mem[mem_key]
+            if now - ts < _TILE_MEM_TTL:
+                self._tile_mem.move_to_end(mem_key)  # LRU touch
+                return img
+            # Stale in memory — fall through to disk/network refresh.
+
         cache_path = self.tile_cache_path(lod, tile_x, tile_z)
         cache_exists = cache_path.exists()
 
-        # Fresh cache: serve directly without touching upstream. _read_cached_tile
-        # returns None on corruption so we fall through to a refetch instead of
-        # raising.
+        # Fresh disk cache: decode once and store in memory.
         if cache_exists:
-            age = time.time() - cache_path.stat().st_mtime
+            age = now - cache_path.stat().st_mtime
             if age < self.config.cache_ttl_seconds:
                 cached = self._read_cached_tile(cache_path)
                 if cached is not None:
+                    self._store_tile_mem(mem_key, now, cached)
                     return cached
         else:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,22 +185,39 @@ class BlueMapClient:
             )
             if response.status_code == 404:
                 if cache_exists:
-                    return self._read_cached_tile(cache_path)
+                    img = self._read_cached_tile(cache_path)
+                    if img is not None:
+                        self._store_tile_mem(mem_key, now, img)
+                    return img
                 return None
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
             if "image/png" not in content_type:
                 if cache_exists:
-                    return self._read_cached_tile(cache_path)
+                    img = self._read_cached_tile(cache_path)
+                    if img is not None:
+                        self._store_tile_mem(mem_key, now, img)
+                    return img
                 return None
 
             image = Image.open(io.BytesIO(response.content)).convert("RGBA")
             self._save_tile_atomic(image, cache_path)
+            self._store_tile_mem(mem_key, now, image)
             return image
         except requests.RequestException:
             if cache_exists:
-                return self._read_cached_tile(cache_path)
+                img = self._read_cached_tile(cache_path)
+                if img is not None:
+                    self._store_tile_mem(mem_key, now, img)
+                return img
             raise
+
+    def _store_tile_mem(self, key: tuple, ts: float, img: Image.Image) -> None:
+        """Insert/update memory cache with LRU eviction at _TILE_MEM_MAX entries."""
+        self._tile_mem[key] = (ts, img)
+        self._tile_mem.move_to_end(key)
+        while len(self._tile_mem) > _TILE_MEM_MAX:
+            self._tile_mem.popitem(last=False)
 
     def live_markers(self) -> dict:
         response = self.session.get(
