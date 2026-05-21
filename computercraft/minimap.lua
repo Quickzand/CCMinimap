@@ -486,10 +486,9 @@ local state = {
   pendingTapTimer = nil, -- timer id for committing the pending tap
   -- Transponder: other ships' last-broadcast position/heading, keyed by their
   -- airshipName. Populated by rednet STATE_PROTOCOL listener; TTL-evicted in
-  -- fastTick after PEER_SHIP_TTL with no fresh broadcast.
+  -- the rednet loop.
   peerShips = {},
 }
-local PEER_SHIP_TTL = 5.0  -- seconds; ~10x STATE_BROADCAST_INTERVAL
 local buttons = {}
 
 local function findMonitor()
@@ -907,27 +906,44 @@ local function isSelected(kind, name)
   return state.target and state.target.kind == kind and state.target.name == name
 end
 
--- Rasterize a small heading-oriented filled triangle ("chevron") into the
--- character cells around (col, row), pointing in headingDeg (compass: 0=N,
--- 90=E, ...). Tip 3 sub-pixels ahead of center, base 2 behind, half-width 1.5.
--- Like overlaySelfTriangle but tiny, and using overlayCell(override=true) so
--- the terrain bg under each cell is preserved -- only the lit sub-pixels
--- recolour to `color`, so the marker sits on top of the map without masking
--- it. Footprint is ~2x2 cells for cardinals, occasionally spilling to 3x2 for
--- diagonals. Returns the bounding box {col1,col2,row1,row2} so callers can
--- register an appropriately-sized tap target (nil if nothing was painted, e.g.
--- chevron fully clipped off-screen).
--- Forward declared so overlayMarkerChevron can fall back to it for headingless
--- broadcasters (e.g. a future bare-bones beacon with no compass). Defined below.
-local overlayMarkerDisc
+-- Palette helpers: declared above the marker do-block so the closures inside
+-- it (and other later code at chunk level) can both reach them as upvalues.
+local NAMED_HEX = {
+  white="0", yellow="1", red="2", cyan="3", lightblue="3", lime="4",
+  green="d", darkgreen="5", gray="8", lightgray="6", blue="9",
+  brown="c", orange="e", black="f",
+}
+local function paletteHexFor(name)
+  return NAMED_HEX[(name or ""):lower()] or "1"
+end
+local HEX_TO_COLOR = {
+  ["0"]=colors.white,    ["1"]=colors.orange,    ["2"]=colors.magenta,
+  ["3"]=colors.lightBlue,["4"]=colors.yellow,    ["5"]=colors.lime,
+  ["6"]=colors.pink,     ["7"]=colors.gray,      ["8"]=colors.lightGray,
+  ["9"]=colors.cyan,     ["a"]=colors.purple,    ["b"]=colors.blue,
+  ["c"]=colors.brown,    ["d"]=colors.green,     ["e"]=colors.red,
+  ["f"]=colors.black,
+}
 
+-- Marker subsystem. The chevron/disc rasterizers and per-row hitbox helper are
+-- only used by the three overlay functions immediately below, so they live
+-- inside a do-block as upvalues -- saves 3 top-level local slots (Lua caps
+-- locals at 200 per function and the chunk is a function).
+local overlayOtherPlayers, overlayOtherShips, overlayWaypoints
+do
+
+-- Rasterize a small heading-oriented filled triangle ("chevron") at (col, row),
+-- pointing in headingDeg (compass: 0=N, 90=E). Tip 3 sub-pixels ahead of
+-- center, base 2 behind, half-width 1.5. Like overlaySelfTriangle but tiny,
+-- and using overlayCell(override=true) so the terrain bg under each cell is
+-- preserved -- only the lit sub-pixels recolour to `color`. Footprint is ~2x2
+-- cells for cardinals, occasionally spilling to 3x2 for diagonals. Returns
+-- the bounding box {col1,col2,row1,row2} so callers can register an
+-- appropriately-sized tap target (nil if nothing painted, e.g. fully clipped).
+local overlayMarkerDisc   -- forward decl: chevron falls back to disc when
+                          -- headingDeg is nil (headingless beacons).
 local function overlayMarkerChevron(col, row, headingDeg, color, mapH)
-  if headingDeg == nil then
-    -- No heading information -- draw a symmetric disc instead of lying with a
-    -- north-pointing chevron. Used by beacons and any peer broadcasting without
-    -- a compass.
-    return overlayMarkerDisc(col, row, color, mapH)
-  end
+  if headingDeg == nil then return overlayMarkerDisc(col, row, color, mapH) end
   local rad = math.rad(headingDeg)
   local dx = math.sin(rad)
   local dy = -math.cos(rad)
@@ -980,10 +996,8 @@ local function overlayMarkerChevron(col, row, headingDeg, color, mapH)
   return { col1 = minC, col2 = maxC, row1 = minR, row2 = maxR }
 end
 
--- Filled disc, sub-pixel rasterized in the same style as the chevron. Used
--- for static markers (waypoints) and headingless beacons. rSub=1.5 gives a
--- ~3x3 sub-pixel footprint -> ~2x2 cells in practice. Preserves terrain bg
--- via overlayCell(override=true).
+-- Filled disc rasterizer for static markers (waypoints) and headingless
+-- beacons. rSub=1.5 gives a ~3x3 sub-pixel footprint, fitting ~2x2 cells.
 overlayMarkerDisc = function(col, row, color, mapH, rSub)
   rSub = rSub or 1.5
   local cSubX = (col - 1) * SUB_W + (SUB_W - 1) / 2
@@ -1022,10 +1036,10 @@ overlayMarkerDisc = function(col, row, color, mapH, rSub)
   return { col1 = minC, col2 = maxC, row1 = minR, row2 = maxR }
 end
 
--- Register one targetCells entry per row in the chevron's bounding box so the
+-- Register one targetCells entry per row in the marker's bounding box so the
 -- tap area matches what's painted. Per-row because the touch matcher only
 -- supports single-row spans (col1..col2 at one row).
-local function registerChevronHitbox(bbox, kind, name, x, z, color)
+local function registerHitbox(bbox, kind, name, x, z, color)
   if not bbox then return end
   for r = bbox.row1, bbox.row2 do
     table.insert(state.targetCells, {
@@ -1037,7 +1051,7 @@ end
 
 -- restampOnly: skip targetCells mutation so the fastTick re-blit doesn't
 -- multiply click targets between fullRedraws.
-local function overlayOtherPlayers(cx, cz, mapH, restampOnly)
+overlayOtherPlayers = function(cx, cz, mapH, restampOnly)
   for _, p in ipairs(state.players or {}) do
     if p.name ~= PLAYER_NAME and p.position then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
@@ -1048,7 +1062,7 @@ local function overlayOtherPlayers(cx, cz, mapH, restampOnly)
       end
       local bbox = overlayMarkerChevron(col, row, heading, color, mapH)
       if not restampOnly then
-        registerChevronHitbox(bbox, "player", p.name, p.position.x, p.position.z, color)
+        registerHitbox(bbox, "player", p.name, p.position.x, p.position.z, color)
       end
     end
   end
@@ -1056,49 +1070,33 @@ end
 
 -- Same shape as overlayOtherPlayers but iterates state.peerShips populated by
 -- the rednet transponder. peer.heading already comes in compass convention.
-local function overlayOtherShips(cx, cz, mapH, restampOnly)
+overlayOtherShips = function(cx, cz, mapH, restampOnly)
   for name, peer in pairs(state.peerShips or {}) do
     if peer.x and peer.z then
       local col, row = worldToCell(peer.x, peer.z, cx, cz, mapH)
       local color = colorForPlayer(name)
       local bbox = overlayMarkerChevron(col, row, peer.heading, color, mapH)
       if not restampOnly then
-        registerChevronHitbox(bbox, "ship", name, peer.x, peer.z, color)
+        registerHitbox(bbox, "ship", name, peer.x, peer.z, color)
       end
     end
   end
 end
 
-local NAMED_HEX = {
-  white="0", yellow="1", red="2", cyan="3", lightblue="3", lime="4",
-  green="d", darkgreen="5", gray="8", lightgray="6", blue="9",
-  brown="c", orange="e", black="f",
-}
-local function paletteHexFor(name)
-  return NAMED_HEX[(name or ""):lower()] or "1"
-end
-
-local HEX_TO_COLOR = {
-  ["0"]=colors.white,    ["1"]=colors.orange,    ["2"]=colors.magenta,
-  ["3"]=colors.lightBlue,["4"]=colors.yellow,    ["5"]=colors.lime,
-  ["6"]=colors.pink,     ["7"]=colors.gray,      ["8"]=colors.lightGray,
-  ["9"]=colors.cyan,     ["a"]=colors.purple,    ["b"]=colors.blue,
-  ["c"]=colors.brown,    ["d"]=colors.green,     ["e"]=colors.red,
-  ["f"]=colors.black,
-}
-
-local function overlayWaypoints(cx, cz, mapH, restampOnly)
+overlayWaypoints = function(cx, cz, mapH, restampOnly)
   for _, wp in ipairs(state.waypoints or {}) do
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
       local color = paletteHexFor(wp.color)
       local bbox = overlayMarkerDisc(col, row, color, mapH)
       if not restampOnly then
-        registerChevronHitbox(bbox, "waypoint", wp.name, wp.x, wp.z, color)
+        registerHitbox(bbox, "waypoint", wp.name, wp.x, wp.z, color)
       end
     end
   end
 end
+
+end -- do: marker subsystem
 
 -- Per-cell luminance classification for the server-pushed MAP_PALETTE (see
 -- server/cc_palette.py). Labels are blit per character with the underlying
@@ -3075,54 +3073,58 @@ local function eventLoop()
   end
 end
 
--- Transponder: ingest a state broadcast from another ship and stash its
--- position/heading under its airshipName. Also updates state.target if the
--- local autopilot is currently following that ship, so the chase point
--- tracks the peer's motion (same pattern as player-follow at fullRedraw).
-local function handlePeerState(msg)
-  if type(msg) ~= "table" then return end
-  local name = msg.airshipName
-  if type(name) ~= "string" or name == "" then return end
-  if name == AIRSHIP_NAME then return end  -- our own broadcast looped back
-  local pos = msg.lastPos
-  if type(pos) ~= "table" or type(pos.x) ~= "number" or type(pos.z) ~= "number" then return end
-  local entry = state.peerShips[name]
-  if not entry then
-    entry = {}
-    state.peerShips[name] = entry
-  end
-  entry.x        = pos.x
-  entry.z        = pos.z
-  entry.y        = pos.y
-  entry.heading  = msg.shipHeading
-  entry.altitude = msg.altitude
-  entry.velocity = msg.velocity
-  entry.seenAt   = os.clock()
-  if state.target and state.target.kind == "ship" and state.target.name == name then
-    state.target.x = entry.x
-    state.target.z = entry.z
-  end
-end
-
-local function evictStalePeers()
-  local now = os.clock()
-  for name, peer in pairs(state.peerShips) do
-    if (now - (peer.seenAt or 0)) > PEER_SHIP_TTL then
-      state.peerShips[name] = nil
-    end
-  end
-end
-
 -- Ship: broadcast a state snapshot every STATE_BROADCAST_INTERVAL, apply
 -- inbound commands, and ingest peer broadcasts. Pocket: look up its own
 -- ship, consume that ship's state broadcasts, and also pick up peer ship
 -- broadcasts directly off the air so peers don't have to round-trip
--- through the host ship.
+-- through the host ship. Peer helpers live inside this function so they
+-- don't burn chunk-level local slots.
 local function rednetLoop()
   if not modemName then
     while state.running do sleep(1) end
     return
   end
+
+  local PEER_SHIP_TTL = 5.0  -- seconds; ~10x STATE_BROADCAST_INTERVAL
+
+  -- Transponder: ingest a state broadcast from another ship and stash its
+  -- position/heading under its airshipName. Also updates state.target if the
+  -- local autopilot is currently following that ship, so the chase point
+  -- tracks the peer's motion (same pattern as player-follow at fullRedraw).
+  local function handlePeerState(msg)
+    if type(msg) ~= "table" then return end
+    local name = msg.airshipName
+    if type(name) ~= "string" or name == "" then return end
+    if name == AIRSHIP_NAME then return end  -- our own broadcast looped back
+    local pos = msg.lastPos
+    if type(pos) ~= "table" or type(pos.x) ~= "number" or type(pos.z) ~= "number" then return end
+    local entry = state.peerShips[name]
+    if not entry then
+      entry = {}
+      state.peerShips[name] = entry
+    end
+    entry.x        = pos.x
+    entry.z        = pos.z
+    entry.y        = pos.y
+    entry.heading  = msg.shipHeading
+    entry.altitude = msg.altitude
+    entry.velocity = msg.velocity
+    entry.seenAt   = os.clock()
+    if state.target and state.target.kind == "ship" and state.target.name == name then
+      state.target.x = entry.x
+      state.target.z = entry.z
+    end
+  end
+
+  local function evictStalePeers()
+    local now = os.clock()
+    for name, peer in pairs(state.peerShips) do
+      if (now - (peer.seenAt or 0)) > PEER_SHIP_TTL then
+        state.peerShips[name] = nil
+      end
+    end
+  end
+
   if IS_POCKET then
     while state.running do
       if not state.shipId then
@@ -3230,13 +3232,6 @@ saveControlState = function()
   f.close()
 end
 
-local function isValidTarget(t)
-  return type(t) == "table"
-     and type(t.kind) == "string"
-     and type(t.x) == "number"
-     and type(t.z) == "number"
-end
-
 loadControlState = function()
   if IS_POCKET then return end
   if not fs.exists("controls.state") then return end
@@ -3245,6 +3240,12 @@ loadControlState = function()
   f.close()
   local ok, data = pcall(textutils.unserialiseJSON, raw)
   if not ok or type(data) ~= "table" then return end
+  local function isValidTarget(t)
+    return type(t) == "table"
+       and type(t.kind) == "string"
+       and type(t.x) == "number"
+       and type(t.z) == "number"
+  end
   -- Restore custom control toggles and re-fire their relays.
   if type(data.customControls) == "table" then
     for name, active in pairs(data.customControls) do
