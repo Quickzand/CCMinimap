@@ -928,8 +928,11 @@ local HEX_TO_COLOR = {
 -- Marker subsystem. The chevron/disc rasterizers and per-row hitbox helper are
 -- only used by the three overlay functions immediately below, so they live
 -- inside a do-block as upvalues -- saves 3 top-level local slots (Lua caps
--- locals at 200 per function and the chunk is a function).
+-- locals at 200 per function and the chunk is a function). blitLabelOverMap
+-- is also forward-declared here because overlayPin (now inside the do-block)
+-- needs to reference it as an upvalue; the real assignment lives just below.
 local overlayOtherPlayers, overlayOtherShips, overlayWaypoints, overlayPin
+local blitLabelOverMap
 do
 
 -- Shared sub-pixel rasterizer: lights one sub-pixel (sxR, syR) in the per-cell
@@ -963,8 +966,12 @@ local function overlayMarkerNeedle(col, row, headingDeg, color, mapH)
 
   local NEEDLE_LEN_SUB = 3
   local needle, base = {}, {}
-  -- Walk the needle from center outward.
-  local steps = NEEDLE_LEN_SUB * 4
+  -- Walk the needle from center outward, sampling densely. ~20 samples per
+  -- sub-pixel guarantees we land on every transition sub-pixel along the path
+  -- so non-cardinal headings don't show a diagonal gap (the previous 4x
+  -- sampling missed intermediate sub-pixels where x and y rolled over at
+  -- nearly the same t).
+  local steps = NEEDLE_LEN_SUB * 20
   for i = 0, steps do
     local t = i / steps
     lightSubPx(needle,
@@ -1015,62 +1022,35 @@ local function overlayMarkerNeedle(col, row, headingDeg, color, mapH)
   return { col1 = minC, col2 = maxC, row1 = minR, row2 = maxR }
 end
 
--- Hollow ring marker for static destinations (waypoints + pins) and
--- headingless beacons. Two-mode rendering, both with the cell bg replaced
--- (so the terrain in marker cells is hidden, like the old PLAYER/WAYPOINT
--- markers did):
+-- Hollow ring marker: 8 sub-pixels arranged around the cell center, hollow
+-- middle. Uses overlayCell(override=true) so the terrain bg shows through
+-- the hollow center and any unused cell sub-pixels -- ring "sits on top of
+-- the map" instead of being painted on a black box.
 --
---   cornerColor == nil  -> "solid" mode: all 8 ring sub-pixels light up in
---     edgeColor against a black cell bg. Used by overlayPin (a solid yellow
---     ring) and by the headingless-needle fallback for peers.
---
---   cornerColor set     -> "two-color" mode: only the 4 cardinal "edge"
---     sub-pixels light up in edgeColor. The 4 diagonal "corner" sub-pixels
---     and any unused sub-pixels in the cell fall to cell bg = cornerColor.
---     Callers flip edge/corner to indicate selection state (e.g. waypoints
---     swap edge=color/corner=black for the default, and edge=black/corner=color
---     when selected).
---
--- Footprint: 1 cell tall x 2 cells wide centered on (col, row).
-overlayMarkerDisc = function(col, row, edgeColor, mapH, cornerColor)
+-- CC's monitor.blit caps each cell at 2 colors (fg + bg), and one of them
+-- is taken by the terrain bg, so we only get ONE marker color per cell.
+-- That means we can't render a true corner-vs-edge two-color ring without
+-- losing the terrain bg. To indicate selection we just swap the ring color
+-- to a contrasting one (white) -- see overlayWaypoints.
+overlayMarkerDisc = function(col, row, color, mapH)
   local cSubX = (col - 1) * SUB_W + (SUB_W - 1) / 2
   local cSubY = (row - 1) * SUB_H + (SUB_H - 1) / 2
-  local edgeOffsets   = { {0, -1}, {-1, 0}, {1, 0}, {0, 1} }
-  local cornerOffsets = { {-1, -1}, {1, -1}, {-1, 1}, {1, 1} }
-  local solidMode = (cornerColor == nil)
-  local bgColor = solidMode and "f" or cornerColor
-
+  local offsets = {
+    {-1, -1}, {0, -1}, {1, -1},
+    {-1,  0},          {1,  0},
+    {-1,  1}, {0,  1}, {1,  1},
+  }
   local cells = {}
-  for _, off in ipairs(edgeOffsets) do
+  for _, off in ipairs(offsets) do
     lightSubPx(cells,
       math.floor(cSubX + off[1] + 0.5),
       math.floor(cSubY + off[2] + 0.5))
   end
-  if solidMode then
-    -- Include corners in the lit pattern so the full ring is visible.
-    for _, off in ipairs(cornerOffsets) do
-      lightSubPx(cells,
-        math.floor(cSubX + off[1] + 0.5),
-        math.floor(cSubY + off[2] + 0.5))
-    end
-  end
-
-  -- Blit per cell. Unlike overlayCell(override=true), bg is explicit (not
-  -- terrain) so corner sub-pixels and unused cell sub-pixels uniformly show
-  -- cornerColor / black instead of whatever terrain was underneath.
   local minC, maxC, minR, maxR = math.huge, -math.huge, math.huge, -math.huge
   for key, bits in pairs(cells) do
     local cc = math.floor(key / 1024)
     local rr = key - cc * 1024
-    if cc >= 1 and cc <= width and rr >= 1 and rr <= mapH then
-      local pattern, fg, bg = bits, edgeColor, bgColor
-      if bit32.band(pattern, 0x20) ~= 0 then
-        pattern = bit32.bxor(pattern, 0x3F)
-        fg, bg = bg, fg
-      end
-      monitor.setCursorPos(cc, rr)
-      monitor.blit(string.char(pattern + 0x80), fg, bg)
-    end
+    overlayCell(cc, rr, bits, color, mapH, true)
     if cc < minC then minC = cc end
     if cc > maxC then maxC = cc end
     if rr < minR then minR = rr end
@@ -1132,16 +1112,11 @@ overlayWaypoints = function(cx, cz, mapH, restampOnly)
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
       local color = paletteHexFor(wp.color)
-      -- Default: edge sub-pixels in waypoint color, cell bg (=corners +
-      -- hollow) black. Selected: flip them -- edges go black, cell bg goes
-      -- waypoint color, giving the marker an obvious inverted look.
-      local edgeColor, cornerColor
-      if isSelected("waypoint", wp.name) then
-        edgeColor, cornerColor = "f", color
-      else
-        edgeColor, cornerColor = color, "f"
-      end
-      local bbox = overlayMarkerDisc(col, row, edgeColor, mapH, cornerColor)
+      -- Selection flips the ring color to white. We can't get a true 2-color
+      -- ring on top of terrain (see overlayMarkerDisc comment), so selection
+      -- is just a clearly contrasting color swap.
+      local ringColor = isSelected("waypoint", wp.name) and "0" or color
+      local bbox = overlayMarkerDisc(col, row, ringColor, mapH)
       if not restampOnly then
         registerHitbox(bbox, "waypoint", wp.name, wp.x, wp.z, color)
       end
@@ -1149,9 +1124,9 @@ overlayWaypoints = function(cx, cz, mapH, restampOnly)
   end
 end
 
--- Pin: solid yellow hollow ring (single color) plus a "PIN" / target-name
--- label. Lives inside the marker do-block so it can call overlayMarkerDisc
--- directly without exposing it at chunk level.
+-- Pin: yellow hollow ring + "PIN" / target-name label. Lives inside the
+-- marker do-block so it can call overlayMarkerDisc directly without
+-- exposing it at chunk level.
 overlayPin = function(cx, cz, mapH)
   if not state.target or state.target.kind ~= "pin" then return end
   local col, row = worldToCell(state.target.x, state.target.z, cx, cz, mapH)
@@ -1203,7 +1178,7 @@ local BG_IS_LIGHT = {
 -- to black or white per cell based on the bg's luminance. Cells with no tile
 -- loaded yet (getCell -> nil) fall back to a black bg so the label is still
 -- legible during pan.
-local function blitLabelOverMap(text, col, row, mapH, preferredFg)
+blitLabelOverMap = function(text, col, row, mapH, preferredFg)
   if row < 1 or row > mapH then return end
   local mcx, mcz = mapCenter()
   local startCol = math.max(1, col)
