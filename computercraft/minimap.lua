@@ -452,6 +452,7 @@ local state = {
   shipId = nil,         -- pocket: rednet id of the ship after lookup
   lastUpdateAt = 0,     -- pocket: os.clock() when last state broadcast received
   lastDialCells = {},   -- same idea for the speedometer needle
+  lastNeedleCells = {}, -- cell keys the compass needle painted last frame, restored next frame
   screen = "map",
   wpScroll = 0,
   settingIdx = 1,
@@ -861,16 +862,38 @@ local function overlaySelfTriangle(heading, mapH, cx, cz)
           end
           monitor.setCursorPos(col, row)
           monitor.blit(string.char(pattern + 0x80), fg, bg)
+          state.lastNeedleCells[col * 1024 + row] = true
         end
       elseif redBits ~= 0 then
         overlayCell(col, row, redBits, "2", mapH, true)
+        if col >= 1 and col <= width and row >= 1 and row <= mapH then
+          state.lastNeedleCells[col * 1024 + row] = true
+        end
       elseif darkBits ~= 0 then
         overlayCell(col, row, darkBits, "7", mapH, true)
-      else
-        overlayCell(col, row, 0, "0", mapH, true)
+        if col >= 1 and col <= width and row >= 1 and row <= mapH then
+          state.lastNeedleCells[col * 1024 + row] = true
+        end
       end
+      -- "neither" cells used to blanket-restore terrain so the old needle
+      -- got erased even when off the new needle's path. eraseSelfTriangle
+      -- now does that targeted restore against state.lastNeedleCells, so
+      -- markers/labels can paint underneath the needle without being wiped.
     end
   end
+end
+
+-- Restore the cached terrain in every cell the needle painted last frame.
+-- Must be called BEFORE the marker overlays each tick so any marker that
+-- happens to fall in an old-needle cell can repaint over the restored
+-- terrain; overlaySelfTriangle then paints the new needle on top.
+local function eraseSelfTriangle(mapH)
+  for key in pairs(state.lastNeedleCells) do
+    local c = math.floor(key / 1024)
+    local r = key - c * 1024
+    overlayCell(c, r, 0, "0", mapH, true)
+  end
+  state.lastNeedleCells = {}
 end
 
 -- Fully replace a single cell with a teletext pattern using forced fg/bg (no terrain preservation).
@@ -1841,6 +1864,10 @@ local function drawSettingsScreen(mapH)
     monitor.write(valPart)
     monitor.setTextColor(nfg)
     monitor.write(pad)
+    table.insert(state.targetCells, {
+      col1 = 1, col2 = width, row = row,
+      cmd = "setting_select", idx = i,
+    })
     lastRow = row
   end
   -- SAVE / CANCEL: tappable buttons below the list. Live when dirty, dimmed when clean.
@@ -2124,18 +2151,22 @@ local function fullRedraw()
       state.lastBurnerLevel = nil
       state.lastTapeCells = {}
       local cx, cz = mapCenter()
+      -- drawCachedMap wiped everything, so the previous needle's painted
+      -- cells are gone; drop the tracker so eraseSelfTriangle doesn't try
+      -- to "restore" them next tick (would be a no-op but a wasteful one).
+      state.lastNeedleCells = {}
       -- Order must match fastTick so markers/labels never blink off in the
-      -- gap between a fullRedraw (1Hz) and the next fastTick (10Hz). The
-      -- needle paints first; trail/waypoints/players/pin/labels then sit on
-      -- top of it inside its bounding box.
-      overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
+      -- gap between a fullRedraw (1Hz) and the next fastTick (10Hz). Needle
+      -- and altitude tape paint last so they sit on top of any marker that
+      -- happens to land in their cells.
       overlayDotTrail(cx, cz, mapH)
       overlayWaypoints(cx, cz, mapH)
       overlayOtherPlayers(cx, cz, mapH)
       overlayPin(cx, cz, mapH)
       overlayMarkerLabels(cx, cz, mapH)
-      overlayAltitudeTape(mapH)
       if not IS_POCKET then overlaySpeedDial(mapH) end
+      overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
+      overlayAltitudeTape(mapH)
     else
       clearMapArea(mapH)
     end
@@ -2310,19 +2341,22 @@ local function fastTick()
   if state.lastPos then
     local mapH = mapHeight()
     if state.screen == "map" and state.hasMap then
-      overlayAltitudeTape(mapH)
       if not IS_POCKET then overlaySpeedDial(mapH) end
       local fcx, fcz = mapCenter()
-      overlaySelfTriangle(state.shipHeading, mapH, fcx, fcz)
-      -- Re-stamp everything the needle wipe might have eaten: trail dots,
-      -- waypoint and player markers, pin, and labels. Mutating overlays
-      -- (waypoints, players) run in restamp-only mode so they don't multiply
-      -- click targets between fullRedraws. 10Hz x ~20 cells is negligible.
+      -- Erase the cells the old needle owned so a marker that's now
+      -- there can repaint cleanly. Then paint the world overlays, then
+      -- the needle and altitude tape on top so they're never obscured.
+      -- Mutating overlays (waypoints, players) run in restamp-only mode
+      -- so the fastTick re-blit doesn't multiply click targets between
+      -- fullRedraws.
+      eraseSelfTriangle(mapH)
       overlayDotTrail(fcx, fcz, mapH)
       overlayWaypoints(fcx, fcz, mapH, true)
       overlayOtherPlayers(fcx, fcz, mapH, true)
       overlayPin(fcx, fcz, mapH)
       overlayMarkerLabels(fcx, fcz, mapH)
+      overlaySelfTriangle(state.shipHeading, mapH, fcx, fcz)
+      overlayAltitudeTape(mapH)
     elseif state.screen == "controls" then
       drawControlsScreen(mapH)
     end
@@ -2598,6 +2632,12 @@ local function applyCommand(cmd)
     state.settingIdx = math.max(1, state.settingIdx - 1)
   elseif id == "setting_next" then
     state.settingIdx = math.min(#SETTINGS, state.settingIdx + 1)
+  elseif id == "setting_select" then
+    local idx = tonumber(cmd.idx)
+    if idx and idx >= 1 and idx <= #SETTINGS then
+      state.settingIdx = idx
+      if state.screen == "settings" then fullRedraw() end
+    end
   elseif id == "setting_inc" then
     local s = SETTINGS[cmd.idx or state.settingIdx]
     if s then
@@ -2635,7 +2675,7 @@ end
 local LOCAL_CMDS = {
   screen_map=true, screen_waypoints=true, screen_controls=true, screen_settings=true,
   wp_scroll_up=true, wp_scroll_down=true,
-  setting_prev=true, setting_next=true,
+  setting_prev=true, setting_next=true, setting_select=true,
   pin_arm_toggle=true,
   recenter=true,
   zoom_in=true, zoom_out=true, lod=true,
@@ -2748,7 +2788,7 @@ local function handleTouch(evtName, side, x, y)
   for _, t in ipairs(state.targetCells or {}) do
     if y == t.row and x >= t.col1 and x <= t.col2 then
       if t.cmd then
-        dispatchCommand({ cmd = t.cmd, name = t.name })
+        dispatchCommand({ cmd = t.cmd, name = t.name, idx = t.idx })
       else
         dispatchCommand({
           cmd = "set_target",
