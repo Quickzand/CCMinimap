@@ -2115,11 +2115,11 @@ local function fullRedraw()
       overlayDotTrail(cx, cz, mapH)
       overlayWaypoints(cx, cz, mapH)
       overlayOtherPlayers(cx, cz, mapH)
+      overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
       overlayPin(cx, cz, mapH)
       overlayMarkerLabels(cx, cz, mapH)
       overlayAltitudeTape(mapH)
       if not IS_POCKET then overlaySpeedDial(mapH) end
-      overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
     else
       clearMapArea(mapH)
     end
