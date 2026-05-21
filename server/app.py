@@ -19,7 +19,7 @@ from render import encode_blit, parse_frame_request, quantize_to_palette, render
 # requested again within the TTL.  Key is quantised to one bpp-unit grid so
 # sub-block ship wobble doesn't bust the cache on every tick.
 _FRAME_CACHE_TTL = 1.0   # seconds a rendered frame stays valid
-_FRAME_CACHE_MAX = 64    # max entries before oldest are evicted
+_FRAME_CACHE_MAX = 256   # client fetches 9 tiles per ship; raised from 64 to fit several ships
 _frame_cache: dict[tuple, tuple[float, dict]] = {}
 _frame_cache_order: list[tuple] = []
 

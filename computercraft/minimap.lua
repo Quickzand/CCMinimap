@@ -442,7 +442,16 @@ local state = {
   players = {},
   waypoints = {},
   sidecarAt = 0,
-  lastFrame = nil,
+  -- Tile grid: world-aligned tiles keyed "i,j", each holds one server frame.
+  -- 3x3 around screen center is fetched/refreshed; the draw path composes the
+  -- visible view from whichever tiles are loaded. Pan never shows white edges
+  -- as long as the relevant tile is cached.
+  tiles = {},
+  hasMap = false,    -- becomes true on first successful tile fetch
+  tileBpp = nil,     -- bpp/lod/w/h captured when current grid was rendered;
+  tileLod = nil,     -- mismatch with current values invalidates the grid.
+  tileW = nil,
+  tileH = nil,
   lastPos = nil,
   lastError = nil,
   mapOffsetX = 0,   -- world-unit pan offset from ship position
@@ -585,11 +594,91 @@ local function decodeTextRow(packed)
   return table.concat(out)
 end
 
+-- Pan-adjusted map centre. All tile fetches and overlay calls use this so
+-- panning shifts both tiles and overlays together.
+local function mapCenter()
+  if not state.lastPos then return 0, 0 end
+  return state.lastPos.x + (state.mapOffsetX or 0),
+         state.lastPos.z + (state.mapOffsetZ or 0)
+end
+
+-- Tile grid helpers. The world is partitioned into width*mapH-cell tiles
+-- aligned to the world origin; tile (i, j) covers world rect centered on
+-- (i*tileWB, j*tileHB). Fetch URL uses that center.
+local function tileKey(i, j) return i .. "," .. j end
+
+local function tileWorldDim(mapH)
+  local bX = state.bpp * SUB_W
+  local bY = state.bpp * SUB_H
+  return width * bX, mapH * bY, bX, bY
+end
+
+local function tileIndexForWorld(wx, wz, mapH)
+  local tileWB, tileHB = tileWorldDim(mapH)
+  return math.floor(wx / tileWB + 0.5), math.floor(wz / tileHB + 0.5)
+end
+
+-- Returns (packed_byte, fg_char, bg_char) for the cell at screen (col, row),
+-- or nil if the relevant tile isn't loaded yet. Used by overlays that need
+-- to read terrain underneath a stencil.
+local function getCell(col, row, mapH, mcx, mcz)
+  local bX = state.bpp * SUB_W
+  local bY = state.bpp * SUB_H
+  local tileWB = width * bX
+  local tileHB = mapH * bY
+  local wx = mcx + (col - width / 2) * bX
+  local wz = mcz + (row - mapH / 2) * bY
+  local ti = math.floor(wx / tileWB + 0.5)
+  local tj = math.floor(wz / tileHB + 0.5)
+  local tile = state.tiles[tileKey(ti, tj)]
+  if not tile then return nil end
+  local tc = math.floor((wx - ti * tileWB) / bX + width / 2 + 0.5)
+  local tr = math.floor((wz - tj * tileHB) / bY + mapH / 2 + 0.5)
+  local row_text = tile.text[tr]
+  if not row_text or tc < 1 or tc > #row_text then return nil end
+  return string.byte(row_text, tc), tile.fg[tr]:sub(tc, tc), tile.bg[tr]:sub(tc, tc)
+end
+
+-- Packed byte 0x40 = pattern 0 (no fg subpixels lit). With bg='f' (black)
+-- and fg='f', the cell renders solid black — used for "no tile loaded yet"
+-- regions during pan or first boot.
+local EMPTY_PACKED = string.char(0x40)
+local EMPTY_FG     = "f"
+local EMPTY_BG     = "f"
+
 local function drawCachedMap(mapH)
-  if not state.lastFrame then return end
-  for y = 1, math.min(#state.lastFrame.text, mapH) do
-    monitor.setCursorPos(1, y)
-    monitor.blit(decodeTextRow(state.lastFrame.text[y]), state.lastFrame.fg[y], state.lastFrame.bg[y])
+  if not state.hasMap or not state.lastPos then return end
+  local mcx, mcz = mapCenter()
+  local bX = state.bpp * SUB_W
+  local bY = state.bpp * SUB_H
+  local tileWB = width * bX
+  local tileHB = mapH * bY
+  for r = 1, mapH do
+    local wz = mcz + (r - mapH / 2) * bY
+    local tj = math.floor(wz / tileHB + 0.5)
+    local tr = math.floor((wz - tj * tileHB) / bY + mapH / 2 + 0.5)
+    local textRow, fgRow, bgRow = {}, {}, {}
+    for c = 1, width do
+      local wx = mcx + (c - width / 2) * bX
+      local ti = math.floor(wx / tileWB + 0.5)
+      local tile = state.tiles[tileKey(ti, tj)]
+      local row_text = tile and tile.text[tr]
+      if row_text then
+        local tc = math.floor((wx - ti * tileWB) / bX + width / 2 + 0.5)
+        if tc >= 1 and tc <= #row_text then
+          textRow[c] = row_text:sub(tc, tc)
+          fgRow[c]   = tile.fg[tr]:sub(tc, tc)
+          bgRow[c]   = tile.bg[tr]:sub(tc, tc)
+        else
+          textRow[c], fgRow[c], bgRow[c] = EMPTY_PACKED, EMPTY_FG, EMPTY_BG
+        end
+      else
+        textRow[c], fgRow[c], bgRow[c] = EMPTY_PACKED, EMPTY_FG, EMPTY_BG
+      end
+    end
+    monitor.setCursorPos(1, r)
+    monitor.blit(decodeTextRow(table.concat(textRow)),
+                 table.concat(fgRow), table.concat(bgRow))
   end
 end
 
@@ -610,14 +699,6 @@ local function cellToWorld(col, row, cx, cz, mapH)
   return wx, wz
 end
 
--- Pan-adjusted map centre. All tile fetches and overlay calls use this so
--- panning shifts both tiles and overlays together.
-local function mapCenter()
-  if not state.lastPos then return 0, 0 end
-  return state.lastPos.x + (state.mapOffsetX or 0),
-         state.lastPos.z + (state.mapOffsetZ or 0)
-end
-
 -- (directionForHeading was only used by the stencil arrow; the needle uses the
 -- raw heading directly.)
 
@@ -628,14 +709,10 @@ end
 
 local function overlayCell(col, row, stenBits, color, mapH, override)
   if col < 1 or col > width or row < 1 or row > mapH then return end
-  if not state.lastFrame or not state.lastFrame.text or not state.lastFrame.text[row] then return end
-  local packed = state.lastFrame.text[row]
-  local fg_row = state.lastFrame.fg[row]
-  local bg_row = state.lastFrame.bg[row]
-  if not fg_row or not bg_row or col > #packed or col > #fg_row or col > #bg_row then return end
-  local cell_pattern = string.byte(packed, col) - 0x40
-  local cell_fg = fg_row:sub(col, col)
-  local cell_bg = bg_row:sub(col, col)
+  local mcx, mcz = mapCenter()
+  local packed_byte, cell_fg, cell_bg = getCell(col, row, mapH, mcx, mcz)
+  if not packed_byte then return end
+  local cell_pattern = packed_byte - 0x40
   local new_pattern, new_fg, new_bg
   if stenBits == 0 then
     -- nothing to draw here; re-blit original cell
@@ -1758,7 +1835,7 @@ local function drawOsd(x, y, z)
     local headingStr = (state.shipHeading and tostring(math.floor((state.shipHeading or 0) + 0.5))) or "--"
     local pCount = #(state.players or {})
     local pInfo  = "P" .. pCount
-    if not IS_POCKET and state.lastFrame and state.lastPos and state.players[1] and state.players[1].position then
+    if not IS_POCKET and state.hasMap and state.lastPos and state.players[1] and state.players[1].position then
       local pp = state.players[1]
       local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapHeight())
       pInfo = pInfo .. ":" .. pcol .. "," .. prow
@@ -1902,7 +1979,7 @@ local function fullRedraw()
   local mapH = mapHeight()
   state.targetCells = {}
   if state.screen == "map" then
-    if state.lastFrame then
+    if state.hasMap then
       drawCachedMap(mapH)
       state.lastTapeAlt = nil
       state.lastTapeGround = nil
@@ -1930,6 +2007,26 @@ local function fullRedraw()
   drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y or 0), math.floor(state.lastPos.z))
 end
 
+-- Fetch one tile (ti, tj) at the captured bpp/lod and store it. If state.bpp
+-- or state.lod changed mid-flight, discard the result -- the tile would be
+-- world-aligned to a stale grid.
+local function fetchTile(ti, tj, fetchBpp, fetchLod, mapH)
+  local tileWB, tileHB = tileWorldDim(mapH)
+  local cx = ti * tileWB
+  local cz = tj * tileHB
+  local data, err = httpGetJson(buildUrl(cx, cz))
+  if data and data.text
+     and state.bpp == fetchBpp and state.lod == fetchLod
+     and state.tileW == width and state.tileH == mapH then
+    state.tiles[tileKey(ti, tj)] = { text = data.text, fg = data.fg, bg = data.bg }
+    state.hasMap = true
+    return true
+  end
+  if data and data.error then state.lastError = data.error
+  elseif err then state.lastError = err end
+  return false
+end
+
 local function mapTick()
   maybeFetchSidecar()
   if not IS_POCKET then
@@ -1941,16 +2038,54 @@ local function mapTick()
     drawError(state.shipId and "Waiting for ship state..." or "Looking for ship...")
     return
   end
+
+  local mapH = mapHeight()
+  -- Grid invalidation: any zoom/resize wipes tiles. They map to different
+  -- world rects under new bpp, so reusing them would draw garbage.
+  if state.tileBpp ~= state.bpp or state.tileLod ~= state.lod
+     or state.tileW ~= width or state.tileH ~= mapH then
+    state.tiles = {}
+    state.hasMap = false
+    state.tileBpp = state.bpp
+    state.tileLod = state.lod
+    state.tileW = width
+    state.tileH = mapH
+  end
+
   local mcx, mcz = mapCenter()
-  local data, err = httpGetJson(buildUrl(mcx, mcz))
-  if data and data.text then
+  local ci, cj = tileIndexForWorld(mcx, mcz, mapH)
+
+  -- Evict tiles outside a 5x5 buffer to bound memory.
+  for k in pairs(state.tiles) do
+    local si, sj = k:match("(-?%d+),(-?%d+)")
+    si, sj = tonumber(si), tonumber(sj)
+    if not si or math.abs(si - ci) > 2 or math.abs(sj - cj) > 2 then
+      state.tiles[k] = nil
+    end
+  end
+
+  -- Build the fetch list for the 3x3 around screen center. Center first so a
+  -- cold start paints under the ship before the corners arrive.
+  local fetchOrder = {{0,0}, {-1,0}, {1,0}, {0,-1}, {0,1}, {-1,-1}, {1,-1}, {-1,1}, {1,1}}
+  local fetchers = {}
+  local fetchBpp, fetchLod = state.bpp, state.lod
+  for _, off in ipairs(fetchOrder) do
+    local ti, tj = ci + off[1], cj + off[2]
+    if not state.tiles[tileKey(ti, tj)] then
+      local cti, ctj = ti, tj   -- capture for closure
+      table.insert(fetchers, function() fetchTile(cti, ctj, fetchBpp, fetchLod, mapH) end)
+    end
+  end
+
+  if #fetchers > 0 then
+    parallel.waitForAll(table.unpack(fetchers))
+  end
+
+  if state.hasMap then
     state.status = "ok"
-    state.lastFrame = data
     fullRedraw()
-  elseif data and data.error then
-    drawError(data.error)
   else
-    drawError(err or "http.get failed")
+    drawError(state.lastError or "Loading map...")
   end
 end
 
@@ -1998,7 +2133,7 @@ local function fastTick()
   end
   if state.lastPos then
     local mapH = mapHeight()
-    if state.screen == "map" and state.lastFrame then
+    if state.screen == "map" and state.hasMap then
       overlayAltitudeTape(mapH)
       if not IS_POCKET then overlaySpeedDial(mapH) end
       local fcx, fcz = mapCenter()
@@ -2032,14 +2167,18 @@ local function applyCommand(cmd)
   if id == "zoom_in" then
     state.bpp = clamp(state.bpp / 2, 0.25, 128)
     state.lod = pickLod(state.bpp)
+    state.tiles = {}; state.hasMap = false  -- bpp change re-maps tile coords
     os.queueEvent("map_dirty")
   elseif id == "zoom_out" then
     state.bpp = clamp(state.bpp * 2, 0.25, 128)
     state.lod = pickLod(state.bpp)
+    state.tiles = {}; state.hasMap = false
     os.queueEvent("map_dirty")
   elseif id == "lod" then
     state.lod = state.lod + 1
     if state.lod > 3 then state.lod = 1 end
+    state.tiles = {}; state.hasMap = false
+    os.queueEvent("map_dirty")
   elseif id == "auto" then
     if state.target then
       state.engaged = not state.engaged
@@ -2314,53 +2453,19 @@ local function dispatchCommand(cmd)
   end
 end
 
+-- Pan by (dx, dy) screen cells. Tiles are world-aligned so panning is just
+-- a viewport offset change -- no frame mutation. The draw path composes from
+-- whichever tiles are loaded; uncovered regions render as black until the
+-- mapLoop fetches them. map_dirty wakes the loop to fetch any new neighbors
+-- the pan brought into view.
 local function applyDrag(dx, dy)
   local bX = state.bpp * SUB_W
   local bY = state.bpp * SUB_H
   state.mapOffsetX = (state.mapOffsetX or 0) - dx * bX
   state.mapOffsetZ = (state.mapOffsetZ or 0) - dy * bY
   state.isDragging = true
-  -- Slide the cached blit frame immediately so panning feels instant before
-  -- fresh tiles arrive from the server. Exposed edges are filled black.
-  if state.lastFrame then
-    local fw = state.lastFrame.w
-    local fh = state.lastFrame.h
-    local cdx = fw and math.max(-fw, math.min(fw, dx)) or 0
-    local cdy = fh and math.max(-fh, math.min(fh, dy)) or 0
-    if fw and fh and (cdx ~= 0 or cdy ~= 0) then
-      local BCH = string.char(0x40)
-      local bT  = string.rep(BCH, fw)
-      local bC  = string.rep("0", fw)
-      local nt, nf, nb = {}, {}, {}
-      for r = 1, fh do
-        local s = r - cdy
-        if s >= 1 and s <= fh then
-          local t = state.lastFrame.text[s]
-          local f = state.lastFrame.fg[s]
-          local b = state.lastFrame.bg[s]
-          if cdx > 0 then
-            local p = string.rep(BCH, cdx); local pc = string.rep("0", cdx)
-            t = p  .. t:sub(1, fw - cdx)
-            f = pc .. f:sub(1, fw - cdx)
-            b = pc .. b:sub(1, fw - cdx)
-          elseif cdx < 0 then
-            local a = -cdx; local p = string.rep(BCH, a); local pc = string.rep("0", a)
-            t = t:sub(a+1) .. p
-            f = f:sub(a+1) .. pc
-            b = b:sub(a+1) .. pc
-          end
-          nt[r]=t; nf[r]=f; nb[r]=b
-        else
-          nt[r]=bT; nf[r]=bC; nb[r]=bC
-        end
-      end
-      state.lastFrame.text = nt
-      state.lastFrame.fg   = nf
-      state.lastFrame.bg   = nb
-    end
-    fullRedraw()
-  end
-  os.queueEvent("map_dirty")        -- wake mapLoop to fetch correct tiles
+  if state.hasMap then fullRedraw() end
+  os.queueEvent("map_dirty")
 end
 
 -- commitPendingTap is stored on the state table so it can be called from
@@ -2371,7 +2476,7 @@ state._commitTap = function()
   state.pendingTapTimer = nil
   if not tap then return end
   if state.screen == "map" and not state.pinLock
-     and state.lastPos and state.lastFrame and tap.y <= mapHeight() then
+     and state.lastPos and state.hasMap and tap.y <= mapHeight() then
     local cx, cz = mapCenter()
     local wx, wz = cellToWorld(tap.x, tap.y, cx, cz, mapHeight())
     dispatchCommand({
@@ -2393,7 +2498,7 @@ local function handleTouch(evtName, side, x, y)
   -- monitor_touch fires for every cell entered during a drag, so we need to
   -- disambiguate drag from tap before committing pin placement.
   local isMonitorTouch = (evtName == "monitor_touch")
-  if state.screen == "map" and state.lastPos and state.lastFrame and y <= mapH then
+  if state.screen == "map" and state.lastPos and state.hasMap and y <= mapH then
     local now = os.clock()
     local px, py, pt = state.dragPrevX, state.dragPrevY, state.dragPrevTime or 0
     state.dragPrevX, state.dragPrevY, state.dragPrevTime = x, y, now
@@ -2449,7 +2554,7 @@ local function handleTouch(evtName, side, x, y)
   end
   -- Map tap: place a pin at the tapped world location (unless PIN lock is on).
   if state.screen == "map" and not state.pinLock
-     and state.lastPos and state.lastFrame and y <= mapHeight() then
+     and state.lastPos and state.hasMap and y <= mapHeight() then
     local cx, cz = mapCenter()
     local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
     dispatchCommand({
@@ -2506,7 +2611,7 @@ local function eventLoop()
       handleTouch(unpackValues(event))
     elseif event[1] == "mouse_drag" then
       -- Pocket terminal drag: event = { "mouse_drag", button, x, y }
-      if state.screen == "map" and state.lastPos and state.lastFrame then
+      if state.screen == "map" and state.lastPos and state.hasMap then
         local mx, my = event[3], event[4]
         if state.dragPrevX ~= nil then
           local dx = mx - state.dragPrevX
