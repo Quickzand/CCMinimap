@@ -613,9 +613,15 @@ local function tileWorldDim(mapH)
   return width * bX, mapH * bY, bX, bY
 end
 
+-- Cells in tile (i, j) have centres at i*tileWB + (c - width/2)*bX for
+-- c in [1, width]. The tile boundary therefore sits half a cell past
+-- i*tileWB + tileWB/2 -- naive `floor(wx/tileWB + 0.5)` puts boundary cells
+-- in the wrong tile and produces black lines between tiles. Shift by half
+-- a cell to align tile boundaries with the half-cell-offset cell grid.
 local function tileIndexForWorld(wx, wz, mapH)
-  local tileWB, tileHB = tileWorldDim(mapH)
-  return math.floor(wx / tileWB + 0.5), math.floor(wz / tileHB + 0.5)
+  local tileWB, tileHB, bX, bY = tileWorldDim(mapH)
+  return math.floor((wx + (tileWB - bX) / 2) / tileWB),
+         math.floor((wz + (tileHB - bY) / 2) / tileHB)
 end
 
 -- Returns (packed_byte, fg_char, bg_char) for the cell at screen (col, row),
@@ -628,8 +634,8 @@ local function getCell(col, row, mapH, mcx, mcz)
   local tileHB = mapH * bY
   local wx = mcx + (col - width / 2) * bX
   local wz = mcz + (row - mapH / 2) * bY
-  local ti = math.floor(wx / tileWB + 0.5)
-  local tj = math.floor(wz / tileHB + 0.5)
+  local ti = math.floor((wx + (tileWB - bX) / 2) / tileWB)
+  local tj = math.floor((wz + (tileHB - bY) / 2) / tileHB)
   local tile = state.tiles[tileKey(ti, tj)]
   if not tile then return nil end
   local tc = math.floor((wx - ti * tileWB) / bX + width / 2 + 0.5)
@@ -653,14 +659,16 @@ local function drawCachedMap(mapH)
   local bY = state.bpp * SUB_H
   local tileWB = width * bX
   local tileHB = mapH * bY
+  local halfDxX = (tileWB - bX) / 2
+  local halfDxY = (tileHB - bY) / 2
   for r = 1, mapH do
     local wz = mcz + (r - mapH / 2) * bY
-    local tj = math.floor(wz / tileHB + 0.5)
+    local tj = math.floor((wz + halfDxY) / tileHB)
     local tr = math.floor((wz - tj * tileHB) / bY + mapH / 2 + 0.5)
     local textRow, fgRow, bgRow = {}, {}, {}
     for c = 1, width do
       local wx = mcx + (c - width / 2) * bX
-      local ti = math.floor(wx / tileWB + 0.5)
+      local ti = math.floor((wx + halfDxX) / tileWB)
       local tile = state.tiles[tileKey(ti, tj)]
       local row_text = tile and tile.text[tr]
       if row_text then
@@ -2064,26 +2072,39 @@ local function mapTick()
     end
   end
 
-  -- Build the fetch list for the 3x3 around screen center. Center first so a
-  -- cold start paints under the ship before the corners arrive.
-  local fetchOrder = {{0,0}, {-1,0}, {1,0}, {0,-1}, {0,1}, {-1,-1}, {1,-1}, {-1,1}, {1,1}}
-  local fetchers = {}
+  -- Phased fetch: server has tight memory (gunicorn workers OOM on 9
+  -- concurrent renders at low bpp / big monitor). Do the centre alone first
+  -- so a cold start paints the ship's tile fast, then the 8 neighbours in
+  -- batches of 2 with a redraw between each so the map grows visibly.
   local fetchBpp, fetchLod = state.bpp, state.lod
-  for _, off in ipairs(fetchOrder) do
-    local ti, tj = ci + off[1], cj + off[2]
-    if not state.tiles[tileKey(ti, tj)] then
-      local cti, ctj = ti, tj   -- capture for closure
-      table.insert(fetchers, function() fetchTile(cti, ctj, fetchBpp, fetchLod, mapH) end)
-    end
+  if not state.tiles[tileKey(ci, cj)] then
+    fetchTile(ci, cj, fetchBpp, fetchLod, mapH)
+    if state.hasMap then fullRedraw() end
   end
 
-  if #fetchers > 0 then
-    parallel.waitForAll(table.unpack(fetchers))
+  local neighborBatches = {
+    {{-1, 0}, {1, 0}},
+    {{0, -1}, {0, 1}},
+    {{-1, -1}, {1, 1}},
+    {{1, -1}, {-1, 1}},
+  }
+  for _, batch in ipairs(neighborBatches) do
+    local fetchers = {}
+    for _, off in ipairs(batch) do
+      local ti, tj = ci + off[1], cj + off[2]
+      if not state.tiles[tileKey(ti, tj)] then
+        local cti, ctj = ti, tj
+        table.insert(fetchers, function() fetchTile(cti, ctj, fetchBpp, fetchLod, mapH) end)
+      end
+    end
+    if #fetchers > 0 then
+      parallel.waitForAll(table.unpack(fetchers))
+      if state.hasMap then fullRedraw() end
+    end
   end
 
   if state.hasMap then
     state.status = "ok"
-    fullRedraw()
   else
     drawError(state.lastError or "Loading map...")
   end

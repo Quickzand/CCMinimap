@@ -20,8 +20,11 @@ services:
       CLIENT_SERVER_URL: ${CLIENT_SERVER_URL:?set CLIENT_SERVER_URL in .env}
       CLIENT_PLAYER_NAME: ${CLIENT_PLAYER_NAME:-}
     command: ["gunicorn", "--bind", "0.0.0.0:5055", "--workers", "1", "--threads", "2", "--timeout", "30", "--access-logfile", "-", "app:app"]
-    mem_limit: 96m
-    memswap_limit: 96m
+    # Was 96m; client now fetches 9 tiles per ship and a low-bpp render can
+    # allocate ~30-50 MB transiently. Two concurrent renders + Python overhead
+    # blew the old cap. 256m gives headroom without ballooning the container.
+    mem_limit: 256m
+    memswap_limit: 256m
     ports:
       - "5055:5055"
     volumes:
