@@ -2839,6 +2839,8 @@ local function handleTouch(evtName, side, x, y)
   if state.screen == "map" and state.lastPos and state.hasMap and y <= mapH then
     local now = os.clock()
     local px, py, pt = state.dragPrevX, state.dragPrevY, state.dragPrevTime or 0
+    local newGesture = (px == nil or py == nil or (now - pt) >= 0.6)
+    if newGesture then px, py = nil, nil end
     state.dragPrevX, state.dragPrevY, state.dragPrevTime = x, y, now
     if isMonitorTouch and state.pinHold and state.pinHold.x == x and state.pinHold.y == y then
       state.pinHold.seenAgain = true
@@ -2859,7 +2861,7 @@ local function handleTouch(evtName, side, x, y)
     -- For monitor_touch, the first contact in a map area is ambiguous: it
     -- could be a tap or the start of a drag.  Defer pin placement by 0.25s so
     -- we can cancel it if the next event is a drag step.
-    if isMonitorTouch and px == nil then
+    if isMonitorTouch and newGesture then
       state.pendingMapTap  = { x = x, y = y }
       state.pendingTapTimer = os.startTimer(0.25)
       if not state.pinArmed then state._startPinHold(x, y, true) end
