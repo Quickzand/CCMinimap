@@ -293,6 +293,10 @@ def create_app() -> Flask:
     def ship_lua():
         return serve_lua("/app/computercraft/ship.lua")
 
+    @app.get("/chatctl.lua")
+    def chatctl_lua():
+        return serve_lua("/app/computercraft/chatctl.lua")
+
     @app.get("/lift.lua")
     def lift_lua():
         return serve_lua("/app/computercraft/lift.lua")
