@@ -15,6 +15,8 @@ local function readFile(p)
 end
 
 local function writeFile(p, s)
+  local dir = fs.getDir(p)
+  if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
   local f = fs.open(p, "w")
   f.write(s)
   f.close()
@@ -55,6 +57,7 @@ end
 
 -- 2. Pull the pocket client (same minimap.lua content under a different name).
 syncFile("minimap-pocket.lua", "minimap-pocket.lua")
+syncFile("minimap/cache.lua", "minimap/cache.lua")
 
 -- 2a. CLI dispatcher. Invoke commands as `minimap <cmd>`; the minimap.lua
 -- shim below forwards to ship.lua.
