@@ -281,6 +281,12 @@ def create_app() -> Flask:
     def minimap_lua():
         return serve_lua("/app/computercraft/minimap.lua")
 
+    @app.get("/minimap/<path:name>.lua")
+    def minimap_module_lua(name):
+        if "/" in name or name.startswith("."):
+            return jsonify({"error": "invalid module path"}), 400
+        return serve_lua(f"/app/minimap/{name}.lua")
+
     @app.get("/minimap-pocket.lua")
     def minimap_pocket_lua():
         # Same file content as /minimap.lua; minimap.lua branches on pocket~=nil.

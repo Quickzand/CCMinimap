@@ -14,6 +14,8 @@ local function readFile(p)
 end
 
 local function writeFile(p, s)
+  local dir = fs.getDir(p)
+  if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
   local f = fs.open(p, "w")
   f.write(s)
   f.close()
@@ -54,6 +56,7 @@ end
 
 -- 2. Update minimap.lua in place (not yet loaded, so no reboot needed).
 syncFile("minimap.lua")
+syncFile("minimap/cache.lua")
 
 -- 2a. CLI dispatcher. Invoke commands as `minimap <cmd>`; minimap.lua
 -- forwards to ship.lua when called with args.

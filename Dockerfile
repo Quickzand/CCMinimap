@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY server /app
 COPY computercraft /app/computercraft
+COPY minimap /app/minimap
 COPY waypoints.json /app/waypoints.json
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser && \
