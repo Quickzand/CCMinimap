@@ -107,6 +107,7 @@ if not fs.exists(CONFIG_FILE) then
   "maxAltitude": 320,
   "maxSpeed": 5,
   "autoExclusiveDrive": false,
+  "pinHoldEnabled": true,
   "velocityFlipped": true,
   "groundSampleChunkRadius": 1,
   "cruiseAltitudeAboveGround": 50,
@@ -495,6 +496,8 @@ local state = {
   isDragging = false,
   pendingMapTap = nil,   -- {x,y} of first monitor_touch in map area, pending drag/tap disambiguation
   pendingTapTimer = nil, -- timer id for committing the pending tap
+  pinHoldEnabled = (cfg.pinHoldEnabled ~= false),
+  pinHold = nil,         -- {x,y,timer}; long-press map gesture for dropping a pin
   -- Transponder: other ships' last-broadcast position/heading, keyed by their
   -- airshipName. Populated by rednet STATE_PROTOCOL listener; TTL-evicted in
   -- the rednet loop.
@@ -2786,6 +2789,24 @@ end
 
 -- commitPendingTap is stored on the state table so it can be called from
 -- both handleTouch and eventLoop without needing a top-level local slot.
+state._placePinAt = function(x, y, disarm)
+  if state.screen ~= "map" or not state.lastPos or not state.hasMap or y > mapHeight() then return false end
+  local cx, cz = mapCenter()
+  local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
+  dispatchCommand({
+    cmd = "set_target",
+    target = {
+      kind  = "pin",
+      name  = "Pin",
+      x     = math.floor(wx + 0.5),
+      z     = math.floor(wz + 0.5),
+      color = "e",
+    },
+  })
+  if disarm then state.pinArmed = false end
+  return true
+end
+
 state._commitTap = function()
   local tap = state.pendingMapTap
   state.pendingMapTap  = nil
@@ -2793,19 +2814,19 @@ state._commitTap = function()
   if not tap then return end
   if state.screen == "map" and state.pinArmed
      and state.lastPos and state.hasMap and tap.y <= mapHeight() then
-    local cx, cz = mapCenter()
-    local wx, wz = cellToWorld(tap.x, tap.y, cx, cz, mapHeight())
-    dispatchCommand({
-      cmd = "set_target",
-      target = {
-        kind  = "pin",
-        name  = "Pin",
-        x     = math.floor(wx + 0.5),
-        z     = math.floor(wz + 0.5),
-        color = "e",
-      },
-    })
-    state.pinArmed = false
+    state._placePinAt(tap.x, tap.y, true)
+  end
+end
+
+state._cancelPinHold = function()
+  if state.pinHold and state.pinHold.timer then os.cancelTimer(state.pinHold.timer) end
+  state.pinHold = nil
+end
+
+state._startPinHold = function(x, y, requireRepeat)
+  state._cancelPinHold()
+  if state.pinHoldEnabled and state.screen == "map" and state.lastPos and state.hasMap and y <= mapHeight() then
+    state.pinHold = { x = x, y = y, timer = os.startTimer(1.0), requireRepeat = requireRepeat == true }
   end
 end
 
@@ -2819,28 +2840,35 @@ local function handleTouch(evtName, side, x, y)
     local now = os.clock()
     local px, py, pt = state.dragPrevX, state.dragPrevY, state.dragPrevTime or 0
     state.dragPrevX, state.dragPrevY, state.dragPrevTime = x, y, now
+    if isMonitorTouch and state.pinHold and state.pinHold.x == x and state.pinHold.y == y then
+      state.pinHold.seenAgain = true
+    end
     if px ~= nil and py ~= nil and (now - pt) < 0.6 then
       local dx, dy = x - px, y - py
       if math.abs(dx) >= 1 or math.abs(dy) >= 1 then
         -- Cancel any pending tap — this turned out to be a drag gesture.
         state.pendingMapTap  = nil
         state.pendingTapTimer = nil
+        state._cancelPinHold()
         applyDrag(dx, dy)
         return  -- consume as drag, not a tap
       end
     end
     state.isDragging = false
+    if not isMonitorTouch and not state.pinArmed then state._startPinHold(x, y, false) end
     -- For monitor_touch, the first contact in a map area is ambiguous: it
     -- could be a tap or the start of a drag.  Defer pin placement by 0.25s so
     -- we can cancel it if the next event is a drag step.
     if isMonitorTouch and px == nil then
       state.pendingMapTap  = { x = x, y = y }
       state.pendingTapTimer = os.startTimer(0.25)
+      if not state.pinArmed then state._startPinHold(x, y, true) end
       return
     end
   else
     state.dragPrevX, state.dragPrevY = nil, nil
     state.isDragging = false
+    state._cancelPinHold()
     -- Moved out of map area — commit any pending tap (conservative: treat it
     -- as intentional since a drag would have moved within the map).
     if state.pendingMapTap then state._commitTap() end
@@ -2852,6 +2880,7 @@ local function handleTouch(evtName, side, x, y)
       if id == "setting_inc" or id == "setting_dec" then
         c.idx = state.settingIdx
       end
+      state._cancelPinHold()
       dispatchCommand(c)
       return
     end
@@ -2866,6 +2895,7 @@ local function handleTouch(evtName, side, x, y)
           target = { kind = t.kind, name = t.name, x = t.x, z = t.z, color = t.color },
         })
       end
+      state._cancelPinHold()
       return
     end
   end
@@ -2873,19 +2903,7 @@ local function handleTouch(evtName, side, x, y)
   -- the PIN button; auto-disarms after placement).
   if state.screen == "map" and state.pinArmed
      and state.lastPos and state.hasMap and y <= mapHeight() then
-    local cx, cz = mapCenter()
-    local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
-    dispatchCommand({
-      cmd = "set_target",
-      target = {
-        kind  = "pin",
-        name  = "Pin",
-        x     = math.floor(wx + 0.5),
-        z     = math.floor(wz + 0.5),
-        color = "e",
-      },
-    })
-    state.pinArmed = false
+    state._placePinAt(x, y, true)
   end
 end
 
@@ -2934,6 +2952,7 @@ local function eventLoop()
     elseif event[1] == "mouse_drag" then
       -- Pocket terminal drag: event = { "mouse_drag", button, x, y }
       if state.screen == "map" and state.lastPos and state.hasMap then
+        state._cancelPinHold()
         local mx, my = event[3], event[4]
         if state.dragPrevX ~= nil then
           local dx = mx - state.dragPrevX
@@ -2946,6 +2965,7 @@ local function eventLoop()
       -- End of drag: clear drag state so next click isn't treated as drag delta.
       state.dragPrevX, state.dragPrevY = nil, nil
       state.isDragging = false
+      state._cancelPinHold()
     elseif event[1] == "mouse_scroll" then
       -- Scroll wheel / two-finger swipe on pocket: zoom in/out on the map.
       -- direction = -1 (scroll up / pinch open) → zoom in (smaller bpp)
@@ -2958,6 +2978,12 @@ local function eventLoop()
       -- Commit a deferred monitor_touch pin tap once no drag has cancelled it.
       if event[2] == state.pendingTapTimer then
         state._commitTap()
+      elseif state.pinHold and event[2] == state.pinHold.timer then
+        local hold = state.pinHold
+        state.pinHold = nil
+        if not hold.requireRepeat or hold.seenAgain then
+          state._placePinAt(hold.x, hold.y, false)
+        end
       end
     elseif event[1] == "term_resize" then
       width, height = monitor.getSize()
