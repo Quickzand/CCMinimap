@@ -58,6 +58,7 @@ syncFile("minimap.lua")
 -- 2a. CLI dispatcher. Invoke commands as `minimap <cmd>`; minimap.lua
 -- forwards to ship.lua when called with args.
 syncFile("ship.lua")
+syncFile("chatctl.lua")
 
 -- 2b. Shared Lua modules (shared between CCMinimap and Spruce). Synced
 -- before minimap.lua launches so its `dofile(...)` calls succeed.
@@ -130,3 +131,4 @@ if minimapPath then
 end
 
 shell.run("bg", "minimap")
+shell.run("bg", "chatctl")
