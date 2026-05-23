@@ -23,6 +23,8 @@ local NAV_METHOD = nil
 local FRAME_INTERVAL = 1.0
 local NAV_INTERVAL = 0.1
 local SIDECAR_INTERVAL = 2.5
+local FRONTIER_SIDECAR_INTERVAL = 1.0
+local INCOMPLETE_RETRY_S = {2, 5, 10, 15}
 
 -- Rednet protocols. Ship hosts as SHIP_HOST on SHIP_PROTO so pockets can find
 -- it via rednet.lookup. State is broadcast on STATE_PROTOCOL; commands flow
@@ -456,6 +458,8 @@ local state = {
   players = {},
   waypoints = {},
   sidecarAt = 0,
+  frontierMode = false,
+  heightMissingTiles = 0,
   -- Tile grid: world-aligned tiles keyed "i,j", each holds one server frame.
   -- 3x3 around screen center is fetched/refreshed; the draw path composes the
   -- visible view from whichever tiles are loaded. Pan never shows white edges
@@ -624,6 +628,11 @@ local function decodeTextRow(packed)
     out[i] = string.char(string.byte(packed, i) + 0x40)
   end
   return table.concat(out)
+end
+
+local function incompleteRetryDelay(attempt)
+  local idx = math.min(#INCOMPLETE_RETRY_S, math.max(1, attempt or 1))
+  return INCOMPLETE_RETRY_S[idx]
 end
 
 -- Pan-adjusted map centre. All tile fetches and overlay calls use this so
@@ -2268,7 +2277,8 @@ end
 
 local function maybeFetchSidecar()
   if os.clock() < state.sidecarAt then return end
-  state.sidecarAt = os.clock() + SIDECAR_INTERVAL
+  local interval = state.frontierMode and FRONTIER_SIDECAR_INTERVAL or SIDECAR_INTERVAL
+  state.sidecarAt = os.clock() + interval
   local p = httpGetJson(SERVER .. "/players")
   if p and p.players then state.players = p.players end
   local w = httpGetJson(SERVER .. "/waypoints")
@@ -2284,6 +2294,7 @@ local function maybeFetchSidecar()
     if h and type(h.groundMaxY) == "number" then
       state.groundY = h.groundMaxY
       state.groundYMin = h.groundMinY
+      state.heightMissingTiles = tonumber(h.missingTiles) or 0
     end
   end
 end
@@ -2347,6 +2358,9 @@ end
 -- or state.lod changed mid-flight, discard the result -- the tile would be
 -- world-aligned to a stale grid.
 local function fetchTile(ti, tj, fetchBpp, fetchLod, mapH)
+  local now = os.clock()
+  local key = tileKey(ti, tj)
+  local existing = state.tiles[key]
   local tileWB, tileHB = tileWorldDim(mapH)
   local cx = (state.tileOriginX or 0) + ti * tileWB
   local cz = (state.tileOriginZ or 0) + tj * tileHB
@@ -2354,9 +2368,27 @@ local function fetchTile(ti, tj, fetchBpp, fetchLod, mapH)
   if data and data.text
      and state.bpp == fetchBpp and state.lod == fetchLod
      and state.tileW == width and state.tileH == mapH then
-    state.tiles[tileKey(ti, tj)] = { text = data.text, fg = data.fg, bg = data.bg }
+    local missing = tonumber(data.missingTiles) or 0
+    local complete = (data.complete == true) or missing == 0
+    state.tiles[key] = {
+      text = data.text,
+      fg = data.fg,
+      bg = data.bg,
+      complete = complete,
+      missingTiles = missing,
+      totalTiles = tonumber(data.totalTiles) or 0,
+      retryCount = complete and 0 or ((existing and existing.retryCount or 0) + 1),
+      nextRetryAt = complete and nil or (now + incompleteRetryDelay((existing and existing.retryCount or 0) + 1)),
+      lastFetchAt = now,
+    }
     state.hasMap = true
     return true
+  end
+  if existing and existing.complete == false then
+    local attempt = (existing.retryCount or 0) + 1
+    existing.retryCount = attempt
+    existing.nextRetryAt = now + incompleteRetryDelay(attempt)
+    existing.lastFetchAt = now
   end
   if data and data.error then state.lastError = data.error
   elseif err then state.lastError = err end
@@ -2394,6 +2426,8 @@ local function mapTick()
   end
 
   local ci, cj = tileIndexForWorld(mcx, mcz, mapH)
+  local now = os.clock()
+  local frontierRetry = (state.heightMissingTiles or 0) > 0
 
   -- Evict tiles outside a 5x5 buffer to bound memory.
   for k in pairs(state.tiles) do
@@ -2409,7 +2443,16 @@ local function mapTick()
   -- so a cold start paints the ship's tile fast, then the 8 neighbours in
   -- batches of 2 with a redraw between each so the map grows visibly.
   local fetchBpp, fetchLod = state.bpp, state.lod
-  if not state.tiles[tileKey(ci, cj)] then
+  local function shouldRetryTile(ti, tj)
+    local tile = state.tiles[tileKey(ti, tj)]
+    return tile and tile.complete == false and (tile.nextRetryAt or 0) <= now
+  end
+  local function tileNeedsAttention(ti, tj)
+    local tile = state.tiles[tileKey(ti, tj)]
+    return not tile or (frontierRetry and shouldRetryTile(ti, tj))
+  end
+  local centerKey = tileKey(ci, cj)
+  if tileNeedsAttention(ci, cj) then
     fetchTile(ci, cj, fetchBpp, fetchLod, mapH)
     if state.hasMap then fullRedraw() end
   end
@@ -2432,7 +2475,7 @@ local function mapTick()
       local fetchers = {}
       for _, off in ipairs(batch) do
         local ti, tj = ci + off[1], cj + off[2]
-        if not state.tiles[tileKey(ti, tj)] then
+        if tileNeedsAttention(ti, tj) then
           local cti, ctj = ti, tj
           table.insert(fetchers, function() fetchTile(cti, ctj, fetchBpp, fetchLod, mapH) end)
         end
@@ -2443,6 +2486,8 @@ local function mapTick()
       end
     end
   end
+
+  state.frontierMode = frontierRetry
 
   if state.hasMap then
     state.status = "ok"
@@ -3019,6 +3064,7 @@ local function stateSnapshot()
     burnerTarget  = state.burnerTarget,
     phase         = state.phase,
     autoStatus    = state.autoStatus,
+    heightMissingTiles = state.heightMissingTiles,
     bpp           = state.bpp,
     lod           = state.lod,
     cruiseAltAgl    = CRUISE_ALT_AGL,
@@ -3179,6 +3225,7 @@ local function rednetLoop()
           state.burnerTarget  = msg.burnerTarget
           state.phase         = msg.phase
           state.autoStatus    = msg.autoStatus or ""
+          state.heightMissingTiles = tonumber(msg.heightMissingTiles) or 0
           -- bpp/lod are local rendering settings; don't let the ship broadcast
           -- overwrite the pocket's own zoom level.
           if msg.cruiseAltAgl   then CRUISE_ALT_AGL        = msg.cruiseAltAgl   end

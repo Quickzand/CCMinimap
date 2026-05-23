@@ -23,6 +23,12 @@ class FrameRequest:
     blocks_per_pixel: float = 2.0  # blocks per *sub-pixel*
 
 
+@dataclass(frozen=True)
+class RenderStats:
+    total_tiles: int
+    missing_tiles: int
+
+
 def parse_frame_request(args) -> FrameRequest:
     def number(name, default, minimum, maximum):
         raw = args.get(name, default)
@@ -47,20 +53,21 @@ def parse_frame_request(args) -> FrameRequest:
     )
 
 
-def _paste_tile(client, canvas, lod, tile_x, tile_z, origin_x, origin_z):
+def _paste_tile(client, canvas, lod, tile_x, tile_z, origin_x, origin_z) -> bool:
     lowres = client.lowres_settings()
     _, _, _, _, lod_scale = client.world_to_lowres_tile(0, 0, lod)
     tile_world = lowres.tile_size * lod_scale
     tile = client.fetch_lowres_tile(lod, tile_x, tile_z)
     if tile is None:
-        return
+        return False
     color_half = tile.crop((0, 0, lowres.tile_size + 1, lowres.tile_size + 1))
     px = round((tile_x * tile_world - origin_x) / lod_scale)
     py = round((tile_z * tile_world - origin_z) / lod_scale)
     canvas.alpha_composite(color_half, (px, py))
+    return True
 
 
-def render_subpixel_image(client: BlueMapClient, req: FrameRequest) -> Image.Image:
+def render_subpixel_image(client: BlueMapClient, req: FrameRequest) -> tuple[Image.Image, RenderStats]:
     """Returns RGB image at sub-pixel resolution: (width*2) x (height*3)."""
     lowres = client.lowres_settings()
     lod_scale = float(lowres.lod_factor ** (req.lod - 1))
@@ -89,13 +96,20 @@ def render_subpixel_image(client: BlueMapClient, req: FrameRequest) -> Image.Ima
     max_tile_x = math.floor((origin_x + crop_world_w) / tile_world)
     min_tile_z = math.floor(origin_z / tile_world)
     max_tile_z = math.floor((origin_z + crop_world_h) / tile_world)
+    total_tiles = 0
+    missing_tiles = 0
 
     for tz in range(min_tile_z, max_tile_z + 1):
         for tx in range(min_tile_x, max_tile_x + 1):
-            _paste_tile(client, canvas, req.lod, tx, tz, origin_x, origin_z)
+            total_tiles += 1
+            if not _paste_tile(client, canvas, req.lod, tx, tz, origin_x, origin_z):
+                missing_tiles += 1
 
     image = canvas.crop((0, 0, source_px_w, source_px_h)).convert("RGB")
-    return image.resize((sub_w, sub_h), Image.Resampling.BILINEAR)
+    return image.resize((sub_w, sub_h), Image.Resampling.BILINEAR), RenderStats(
+        total_tiles=total_tiles,
+        missing_tiles=missing_tiles,
+    )
 
 
 def quantize_to_palette(image: Image.Image) -> Image.Image:

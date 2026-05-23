@@ -91,7 +91,7 @@ def create_app() -> Flask:
             cached = _frame_cache_get(key)
             if cached is not None:
                 return jsonify(cached)
-            image = render_subpixel_image(client, req)
+            image, stats = render_subpixel_image(client, req)
             quant = quantize_to_palette(image)
             text, fg, bg = encode_blit(quant, req.width, req.height)
             result = {
@@ -102,6 +102,9 @@ def create_app() -> Flask:
                 "text": text,
                 "fg": fg,
                 "bg": bg,
+                "totalTiles": stats.total_tiles,
+                "missingTiles": stats.missing_tiles,
+                "complete": stats.missing_tiles == 0,
             }
             _frame_cache_put(key, result)
             return jsonify(result)
@@ -117,7 +120,7 @@ def create_app() -> Flask:
         try:
             req = parse_frame_request(request.args)
             scale = max(1, min(8, int(request.args.get("scale", "4"))))
-            image = render_subpixel_image(client, req)
+            image, _ = render_subpixel_image(client, req)
             quant = quantize_to_palette(image)
             rgb = quant.convert("RGB")
             rgb = rgb.resize((rgb.width * scale, rgb.height * scale), Image.Resampling.NEAREST)
