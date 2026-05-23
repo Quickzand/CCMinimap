@@ -127,6 +127,25 @@ end
 
 local commands = {}
 
+local function normalizeCtlName(name)
+  if type(name) ~= "string" then return nil end
+  local target = name:lower()
+  local s
+  if isShip() or pocket then
+    s = localStatus(1.0)
+  else
+    s = remoteStatus(2.0)
+  end
+  local meta = s and s.customControlsMeta
+  if type(meta) ~= "table" then return name end
+  for _, ctl in ipairs(meta) do
+    if type(ctl) == "table" and type(ctl.name) == "string" and ctl.name:lower() == target then
+      return ctl.name
+    end
+  end
+  return name
+end
+
 commands["goto"] = function(args)
   local x = tonumber(args[1]); local z = tonumber(args[2])
   if not x or not z then print("usage: goto X Z"); return end
@@ -165,6 +184,27 @@ commands["wp"] = function(args)
   local name = table.concat(args, " ")
   send({cmd = "goto_wp", name = name})
   print("wp " .. name)
+end
+
+commands["ctl"] = function(args)
+  local name = args[1]
+  local op = (args[2] or "toggle"):lower()
+  if not name or name == "" then
+    print("usage: ctl <name> [on|off|toggle]")
+    return
+  end
+  local canonical = normalizeCtlName(name)
+  if op == "toggle" then
+    send({cmd = "custom_toggle", name = canonical})
+  elseif op == "on" then
+    send({cmd = "custom_set", name = canonical, active = true})
+  elseif op == "off" then
+    send({cmd = "custom_set", name = canonical, active = false})
+  else
+    print("usage: ctl <name> [on|off|toggle]")
+    return
+  end
+  print(("ctl %s %s"):format(canonical, op))
 end
 
 -- Set or clear the control password locally. Pocket stores plaintext (its
@@ -249,6 +289,7 @@ commands["help"] = function()
   print("  minimap hold [alt]       toggle altitude hold (optional alt)")
   print("  minimap agl [offset]     toggle AGL hold (optional offset m above ground)")
   print("  minimap wp <name>        autopilot to a named waypoint")
+  print("  minimap ctl <name> [op]  custom relay control (on/off/toggle)")
   print("  minimap status           position / heading / mode")
   print("  minimap password [<p>]   set/clear control password (per device)")
   print("")
@@ -257,12 +298,26 @@ end
 commands["--help"] = commands["help"]
 commands["-h"]     = commands["help"]
 
-local args = {...}
-local sub = table.remove(args, 1) or "help"
-local handler = commands[sub]
-if not handler then
-  print("unknown command: " .. sub)
-  commands.help()
-  return
+local M = {
+  commands = commands,
+}
+
+function M.run(argv)
+  local args = {}
+  for i = 1, #(argv or {}) do args[i] = argv[i] end
+  local sub = table.remove(args, 1) or "help"
+  local handler = commands[sub]
+  if not handler then
+    print("unknown command: " .. sub)
+    commands.help()
+    return false
+  end
+  handler(args)
+  return true
 end
-handler(args)
+
+if rawget(_G, "__ship_module") then
+  return M
+end
+
+M.run({...})

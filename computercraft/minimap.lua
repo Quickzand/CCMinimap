@@ -117,6 +117,7 @@ if not fs.exists(CONFIG_FILE) then
   "liftKi": 0.05,
   "liftPulseSeconds": 0.2,
   "landRampSeconds": 2.0,
+  "chatControlEnabled": false,
   "playerName": "",
   "airshipName": "main",
   "labelMode": "always",
@@ -139,6 +140,7 @@ end
 
 local NEEDLE_LENGTH_SUB = tonumber(cfg.needleLength) or 5
 local PEER_NEEDLE_LEN_SUB = tonumber(cfg.peerNeedleLength) or 5
+local CHAT_CONTROL_ENABLED = (cfg.chatControlEnabled == true)
 -- Multi-user override: cfg.playerName wins over the server-substituted default
 -- so two players sharing one BlueMap server can each suppress their own dot.
 if type(cfg.playerName) == "string" and cfg.playerName ~= "" then
@@ -303,6 +305,7 @@ end
 
 local altSensor = peripheral.find("altitude_sensor")
 local velSensor = peripheral.find("velocity_sensor")
+local chatBox = (not IS_POCKET) and peripheral.find("chat_box") or nil
 
 -- Modem for ship<->pocket rednet. Must be a WIRELESS (or ender) modem -- a
 -- wired modem with `isWireless()=false` would happily open but never reach the
@@ -2765,6 +2768,17 @@ local function applyCommand(cmd)
     -- inverted: active = LOW signal; normal: active = HIGH signal
     setControl(name, ctl.inverted ~= active)
     saveControlState()
+  elseif id == "custom_set" then
+    local name = cmd.name
+    if type(name) ~= "string" or type(cmd.active) ~= "boolean" then return end
+    local ctl
+    for _, c in ipairs(CUSTOM_CONTROLS) do
+      if c.name == name then ctl = c; break end
+    end
+    if not ctl then return end
+    state.customControls[name] = cmd.active
+    setControl(name, ctl.inverted ~= cmd.active)
+    saveControlState()
 
   elseif id == "burner_up" then
     -- Context-sensitive: bump whichever altitude target is locked, else burner.
@@ -3076,6 +3090,48 @@ local function eventLoop()
   end
 end
 
+local function parseChatCommand(line)
+  if type(line) ~= "string" then return nil end
+  local prefix = "!minimap"
+  if line:sub(1, #prefix):lower() ~= prefix then return nil end
+  local rest = line:sub(#prefix + 1)
+  if rest:match("^%s*$") then return { "help" } end
+  if type(shell.tokenize) == "function" then
+    local ok, args = pcall(shell.tokenize, rest)
+    if ok and type(args) == "table" then return args end
+  end
+  local args = {}
+  for token in rest:gmatch("%S+") do args[#args + 1] = token end
+  return args
+end
+
+local function chatLoop()
+  if IS_POCKET or not CHAT_CONTROL_ENABLED or not chatBox then
+    while state.running do sleep(1) end
+    return
+  end
+  if type(PLAYER_NAME) ~= "string" or PLAYER_NAME == "" then
+    while state.running do sleep(1) end
+    return
+  end
+  _G.__ship_module = true
+  local ok, Ship = pcall(dofile, "ship.lua")
+  _G.__ship_module = nil
+  if not ok or type(Ship) ~= "table" or type(Ship.run) ~= "function" then
+    while state.running do sleep(1) end
+    return
+  end
+  while state.running do
+    local _, username, message = os.pullEvent("chat")
+    if username == PLAYER_NAME then
+      local args = parseChatCommand(message)
+      if args and #args > 0 then
+        pcall(Ship.run, args)
+      end
+    end
+  end
+end
+
 -- Ship: broadcast a state snapshot every STATE_BROADCAST_INTERVAL, apply
 -- inbound commands, and ingest peer broadcasts. Pocket: look up its own
 -- ship, consume that ship's state broadcasts, and also pick up peer ship
@@ -3295,9 +3351,9 @@ resetAllOutputs()
 -- Restore persisted control state AFTER the reset so saved relay states win.
 loadControlState()
 if modemName then
-  parallel.waitForAny(mapLoop, fastLoop, eventLoop, rednetLoop)
+  parallel.waitForAny(mapLoop, fastLoop, eventLoop, rednetLoop, chatLoop)
 else
-  parallel.waitForAny(mapLoop, fastLoop, eventLoop)
+  parallel.waitForAny(mapLoop, fastLoop, eventLoop, chatLoop)
 end
 -- Clean exit: drop everything so a STOP after `q` doesn't leave a relay HIGH.
 resetAllOutputs()
