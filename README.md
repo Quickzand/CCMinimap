@@ -94,6 +94,8 @@ Tune via `minimap.cfg`:
   oscillates; Ki absorbs altitude-dependent burner equilibrium so AUTO doesn't
   stall short of target over high terrain.
 - `cruiseAltitudeAboveGround`: target AGL when AUTO is engaged
+- `autoExclusiveDrive`: set to `true` to prevent AUTO from commanding forward
+  thrust while turning. Defaults to `false`.
 - `airshipName`, `controlSecret`: pairing values (see below)
 
 ## Pocket

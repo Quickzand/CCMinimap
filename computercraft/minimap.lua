@@ -106,6 +106,7 @@ if not fs.exists(CONFIG_FILE) then
   "showSpeedDial": true,
   "maxAltitude": 320,
   "maxSpeed": 5,
+  "autoExclusiveDrive": false,
   "velocityFlipped": true,
   "groundSampleChunkRadius": 1,
   "cruiseAltitudeAboveGround": 50,
@@ -332,6 +333,7 @@ local SHOW_ALT_TAPE   = (cfg.showAltitudeTape ~= false)
 local SHOW_SPEED_DIAL = (cfg.showSpeedDial ~= false)
 local MAX_ALT   = tonumber(cfg.maxAltitude) or 320
 local MAX_SPEED = tonumber(cfg.maxSpeed) or 5
+local AUTO_EXCLUSIVE_DRIVE = (cfg.autoExclusiveDrive == true)
 local GROUND_CHUNK_RADIUS = math.floor(tonumber(cfg.groundSampleChunkRadius) or 1)
 local VELOCITY_FLIPPED = (cfg.velocityFlipped ~= false)
 local CRUISE_ALT_AGL    = tonumber(cfg.cruiseAltitudeAboveGround) or 50
@@ -1797,9 +1799,10 @@ local function horizontalController()
     setControl("left", err < 0); setControl("right", err > 0)
     state.autoStatus = (err < 0 and "TURN L" or "TURN R") .. string.format(" %dm", math.floor(range))
   elseif math.abs(err) > FINE_THRESHOLD then
-    setControl("forward", true)
+    setControl("forward", not AUTO_EXCLUSIVE_DRIVE)
     setControl("left", err < 0); setControl("right", err > 0)
-    state.autoStatus = string.format("FWD %s %dm", err < 0 and "L" or "R", math.floor(range))
+    local mode = AUTO_EXCLUSIVE_DRIVE and "TURN" or "FWD"
+    state.autoStatus = string.format("%s %s %dm", mode, err < 0 and "L" or "R", math.floor(range))
   else
     setControl("forward", true); setControl("left", false); setControl("right", false)
     state.autoStatus = string.format("FWD %dm", math.floor(range))
