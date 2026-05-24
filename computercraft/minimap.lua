@@ -3,7 +3,7 @@
 -- what startup.lua runs in the background) falls through to the display
 -- program below.
 local _cliArgs = { ... }
-local IS_TERM_CLIENT = (_cliArgs[1] == "--term-client")
+IS_TERM_CLIENT = (_cliArgs[1] == "--term-client")
 if #_cliArgs > 0 and not IS_TERM_CLIENT then
   return shell.run("ship", table.unpack(_cliArgs))
 end
@@ -13,7 +13,7 @@ end
 -- os.queueEvent). The server hosts the file at /minimap.lua (ship) and
 -- /minimap-pocket.lua (pocket); minimap-term.lua is a tiny local-client shim.
 local IS_POCKET = pocket ~= nil
-local IS_CLIENT = IS_POCKET or IS_TERM_CLIENT
+IS_CLIENT = IS_POCKET or IS_TERM_CLIENT
 local CONFIG_FILE = IS_POCKET and "minimap-pocket.cfg" or "minimap.cfg"
 -- __SERVER_URL__ and __PLAYER_NAME__ are substituted by the server (app.py)
 -- from the CLIENT_SERVER_URL / CLIENT_PLAYER_NAME env vars at serve time.
@@ -519,7 +519,6 @@ end
 local monitor = findMonitor()
 if monitor.setTextScale then monitor.setTextScale(0.5) end
 local width, height = monitor.getSize()
-local unpackValues = table.unpack or unpack
 
 -- The pocket has a tight 26x20 screen, so its OSD uses two rows: buttons on
 -- height-1, coord/status on height. The local TERM mirror uses the same compact
@@ -2961,7 +2960,7 @@ local function stateSnapshot()
   }
 end
 
-local function applyClientState(msg)
+function applyClientState(msg)
   if type(msg) ~= "table" then return end
   if msg.lastPos then state.lastPos = msg.lastPos end
   state.shipHeading   = msg.shipHeading or state.shipHeading
@@ -3011,7 +3010,7 @@ local function eventLoop()
   while state.running do
     local event = { os.pullEvent() }
     if event[1] == "monitor_touch" or event[1] == "mouse_click" then
-      handleTouch(unpackValues(event))
+      handleTouch((table.unpack or unpack)(event))
     elseif event[1] == "mouse_drag" then
       -- Pocket terminal drag: event = { "mouse_drag", button, x, y }
       if state.screen == "map" and state.lastPos and state.hasMap then
@@ -3171,7 +3170,7 @@ local function rednetLoop()
   end
 end
 
-local function localStateLoop()
+function localStateLoop()
   local seq = 0
   while state.running do
     seq = seq + 1
