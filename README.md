@@ -97,7 +97,7 @@ Tune via `minimap.cfg`:
 - `autoExclusiveDrive`: set to `true` to prevent AUTO from commanding forward
   thrust while turning. Defaults to `false`.
 - `pinHoldEnabled`: set to `false` to disable dropping a map pin by holding
-  one spot for about one second. Defaults to `true`.
+  one spot for about 0.7 seconds. Defaults to `true`.
 - `airshipName`, `controlSecret`: pairing values (see below)
 
 ## Pocket

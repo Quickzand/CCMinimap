@@ -231,19 +231,19 @@ commands["password"] = function(args)
   if pocket then
     c.controlSecret = newPw
   else
-    if not fs.exists("sha256.lua") then
-      print("sha256.lua missing; reboot to fetch it then retry")
+    if not fs.exists("minimap/sha256.lua") then
+      print("minimap/sha256.lua missing; reboot to fetch it then retry")
       return
     end
-    local Sha = dofile("sha256.lua")
+    local Sha = dofile("minimap/sha256.lua")
     c.controlSecret = nil
     c.controlSecretHash = (newPw == "") and "" or Sha.hash(newPw)
     c.authVersion = 1
   end
 
   local body
-  if fs.exists("cfgutil.lua") then
-    local Cfg = dofile("cfgutil.lua")
+  if fs.exists("minimap/cfgutil.lua") then
+    local Cfg = dofile("minimap/cfgutil.lua")
     body = Cfg.jsonPretty(c) .. "\n"
   else
     body = textutils.serialiseJSON(c)

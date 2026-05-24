@@ -18,3 +18,10 @@ reacts late and may trip STOP_AND_RISE more than necessary. Shift the sample
 center forward along the heading vector by `velocity * lookahead_seconds`, or
 sample two windows (under-ship + ahead) and demand cruise altitude above the
 max. Easy follow-up once the basic altitude controller is tuned.
+
+## Ship computer TERM mirror/control
+Allow the main ship computer to render/control through both the attached
+monitor and the native terminal. This needs separate display/button maps if
+the two surfaces have different sizes, plus logical input de-duping so one
+physical monitor reachable through multiple peripheral paths does not toggle
+buttons twice.

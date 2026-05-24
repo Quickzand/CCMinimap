@@ -172,7 +172,7 @@ if CALLSIGN_LEN > 16 then CALLSIGN_LEN = 16 end
 local AIRSHIP_NAME       = tostring(cfg.airshipName or "main")
 local CONTROL_SECRET     = tostring(cfg.controlSecret or "")
 local CONTROL_SECRET_HASH = tostring(cfg.controlSecretHash or "")
-local Sha = dofile("sha256.lua")
+local Sha = dofile("minimap/sha256.lua")
 
 -- Ship migration: if a legacy plaintext controlSecret still exists on disk,
 -- hash it into controlSecretHash and strip the plaintext. One-shot per ship.
@@ -181,7 +181,7 @@ if not IS_POCKET and CONTROL_SECRET ~= "" then
   cfg.controlSecretHash = CONTROL_SECRET_HASH
   cfg.controlSecret = nil
   CONTROL_SECRET = ""
-  local ok, Cfg = pcall(dofile, "cfgutil.lua")
+  local ok, Cfg = pcall(dofile, "minimap/cfgutil.lua")
   if ok and Cfg and Cfg.jsonPretty then
     local body = Cfg.jsonPretty(cfg) .. "\n"
     if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
@@ -293,9 +293,9 @@ local Lift
 local Altitude
 local Cfg  -- only used on the ship for Settings -> cfg writeback
 if not IS_POCKET then
-  Lift = dofile("lift.lua")
-  Altitude = dofile("altitude.lua")
-  Cfg = dofile("cfgutil.lua")
+  Lift = dofile("minimap/lift.lua")
+  Altitude = dofile("minimap/altitude.lua")
+  Cfg = dofile("minimap/cfgutil.lua")
   Lift.init({
     mode = LIFT_MODE,
     channels = CHANNELS,
@@ -2830,7 +2830,7 @@ end
 state._startPinHold = function(x, y, requireRepeat)
   state._cancelPinHold()
   if state.pinHoldEnabled and state.screen == "map" and state.lastPos and state.hasMap and y <= mapHeight() then
-    state.pinHold = { x = x, y = y, timer = os.startTimer(1.0), requireRepeat = requireRepeat == true }
+    state.pinHold = { x = x, y = y, timer = os.startTimer(0.7), requireRepeat = requireRepeat == true }
   end
 end
 

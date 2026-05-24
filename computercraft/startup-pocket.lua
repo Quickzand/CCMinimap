@@ -58,6 +58,8 @@ end
 -- 2. Pull the pocket client (same minimap.lua content under a different name).
 syncFile("minimap-pocket.lua", "minimap-pocket.lua")
 syncFile("minimap/cache.lua", "minimap/cache.lua")
+syncFile("minimap/cfgutil.lua", "minimap/cfgutil.lua")
+syncFile("minimap/sha256.lua", "minimap/sha256.lua")
 
 -- 2a. CLI dispatcher. Invoke commands as `minimap <cmd>`; the minimap.lua
 -- shim below forwards to ship.lua.
@@ -71,12 +73,10 @@ if readFile("minimap.lua") ~= minimapShim then
   writeFile("minimap.lua", minimapShim)
 end
 
-syncFile("cfgutil.lua", "cfgutil.lua")
 -- sha256.lua isn't strictly needed for v1 pocket auth (pocket sends
 -- plaintext) but minimap.lua dofile()s it unconditionally and it's tiny.
 -- Future v2 challenge-response will need it on the pocket anyway.
-syncFile("sha256.lua", "sha256.lua")
-local Cfg = dofile("cfgutil.lua")
+local Cfg = dofile("minimap/cfgutil.lua")
 
 -- 3. Merge any new default config keys into minimap-pocket.cfg without overwriting.
 -- Only pocket-relevant keys; the ship owns controller/peripheral tunables.

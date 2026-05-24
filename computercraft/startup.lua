@@ -57,19 +57,19 @@ end
 -- 2. Update minimap.lua in place (not yet loaded, so no reboot needed).
 syncFile("minimap.lua")
 syncFile("minimap/cache.lua")
+syncFile("minimap/lift.lua")
+syncFile("minimap/altitude.lua")
+syncFile("minimap/cfgutil.lua")
+syncFile("minimap/sha256.lua")
 
 -- 2a. CLI dispatcher. Invoke commands as `minimap <cmd>`; minimap.lua
 -- forwards to ship.lua when called with args.
 syncFile("ship.lua")
 syncFile("chatctl.lua")
 
--- 2b. Shared Lua modules (shared between CCMinimap and Spruce). Synced
--- before minimap.lua launches so its `dofile(...)` calls succeed.
-syncFile("lift.lua")
-syncFile("altitude.lua")
-syncFile("cfgutil.lua")
-syncFile("sha256.lua")
-local Cfg = dofile("cfgutil.lua")
+-- 2b. Shared Lua modules are synced under minimap/ before minimap.lua
+-- launches so its `dofile(...)` calls succeed.
+local Cfg = dofile("minimap/cfgutil.lua")
 
 -- 3. Merge new default config keys without overwriting existing ones, then
 -- write the result back in pretty form. Writing every boot canonicalises the

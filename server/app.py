@@ -308,19 +308,19 @@ def create_app() -> Flask:
 
     @app.get("/lift.lua")
     def lift_lua():
-        return serve_lua("/app/computercraft/lift.lua")
+        return serve_lua("/app/minimap/lift.lua")
 
     @app.get("/altitude.lua")
     def altitude_lua():
-        return serve_lua("/app/computercraft/altitude.lua")
+        return serve_lua("/app/minimap/altitude.lua")
 
     @app.get("/cfgutil.lua")
     def cfgutil_lua():
-        return serve_lua("/app/computercraft/cfgutil.lua")
+        return serve_lua("/app/minimap/cfgutil.lua")
 
     @app.get("/sha256.lua")
     def sha256_lua():
-        return serve_lua("/app/computercraft/sha256.lua")
+        return serve_lua("/app/minimap/sha256.lua")
 
     return app
 
