@@ -3,7 +3,7 @@
 -- what startup.lua runs in the background) falls through to the display
 -- program below.
 local _cliArgs = { ... }
-IS_TERM_CLIENT = (_cliArgs[1] == "--term-client")
+IS_TERM_CLIENT = (_G.MINIMAP_TERM_CLIENT == true) or (_cliArgs[1] == "--term-client")
 if #_cliArgs > 0 and not IS_TERM_CLIENT then
   return shell.run("ship", table.unpack(_cliArgs))
 end
@@ -552,9 +552,12 @@ end
 local function httpGetJson(url)
   local r, err = http.get(url, { ["accept"] = "application/json" })
   if not r then return nil, err end
-  local body = r.readAll()
-  r.close()
-  return textutils.unserializeJSON(body), nil
+  local ok, body = pcall(r.readAll)
+  pcall(r.close)
+  if not ok then return nil, body end
+  local parsedOk, parsed = pcall(textutils.unserializeJSON, body)
+  if not parsedOk then return nil, parsed end
+  return parsed, nil
 end
 
 -- Find nav peripheral by type then by method scan; mirrors how peripheral.find("speaker") works.
