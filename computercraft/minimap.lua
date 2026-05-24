@@ -2680,9 +2680,11 @@ local function applyCommand(cmd)
     if state.altHoldActive and state.altHoldTarget then
       state.altHoldTarget = state.altHoldTarget + step
       resetLiftIntegrator()
+      saveControlState()
     elseif state.aglHoldActive and state.aglHoldOffset then
       state.aglHoldOffset = state.aglHoldOffset + step
       resetLiftIntegrator()
+      saveControlState()
     else
       local lvl = math.min(15, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) + step)
       applyCommand({ cmd = "set_burner", level = lvl })
@@ -2692,9 +2694,11 @@ local function applyCommand(cmd)
     if state.altHoldActive and state.altHoldTarget then
       state.altHoldTarget = state.altHoldTarget - step
       resetLiftIntegrator()
+      saveControlState()
     elseif state.aglHoldActive and state.aglHoldOffset then
       state.aglHoldOffset = state.aglHoldOffset - step
       resetLiftIntegrator()
+      saveControlState()
     else
       local lvl = math.max(0, (state.burnerLevel or state.burnerTarget or HOVER_BURNER) - step)
       applyCommand({ cmd = "set_burner", level = lvl })

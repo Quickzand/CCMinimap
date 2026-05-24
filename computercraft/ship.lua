@@ -50,14 +50,12 @@ local function openWirelessModem()
   return nil
 end
 
--- "Am I the ship?" -- the ship has the altitude sensor; pocket and remote
--- controllers don't.
-local function isShip()
-  return peripheral.find("altitude_sensor") ~= nil
-end
+local localStatus
 
 local function send(cmd)
-  if isShip() then
+  -- Prefer the local ship minimap process when one is running. This also
+  -- covers ships using GPS altitude fallback instead of altitude_sensor.
+  if not pocket and localStatus(0.2) then
     os.queueEvent("ship_cmd", cmd)
     return true
   end
@@ -71,7 +69,7 @@ local function send(cmd)
 end
 
 -- Query local minimap (works on ship and pocket; both reply to the event).
-local function localStatus(timeout)
+localStatus = function(timeout)
   os.queueEvent("ship_state_request")
   local deadline = os.startTimer(timeout or 1.0)
   while true do
@@ -130,12 +128,7 @@ local commands = {}
 local function normalizeCtlName(name)
   if type(name) ~= "string" then return nil end
   local target = name:lower()
-  local s
-  if isShip() or pocket then
-    s = localStatus(1.0)
-  else
-    s = remoteStatus(2.0)
-  end
+  local s = localStatus(0.5) or remoteStatus(2.0)
   local meta = s and s.customControlsMeta
   if type(meta) ~= "table" then return name end
   for _, ctl in ipairs(meta) do
@@ -217,7 +210,7 @@ commands["password"] = function(args)
   local cfgPath
   if pocket then
     cfgPath = "minimap-pocket.cfg"
-  elseif isShip() then
+  elseif fs.exists("minimap.cfg") then
     cfgPath = "minimap.cfg"
   else
     print("run `minimap password` on the ship or the pocket")
@@ -271,12 +264,7 @@ commands["password"] = function(args)
 end
 
 commands["status"] = function()
-  local s
-  if isShip() or pocket then
-    s = localStatus(1.0)
-  else
-    s = remoteStatus(2.0)
-  end
+  local s = localStatus(1.0) or remoteStatus(2.0)
   printStatus(s)
 end
 
