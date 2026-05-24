@@ -294,6 +294,10 @@ def create_app() -> Flask:
         # filename and config file.
         return serve_lua("/app/computercraft/minimap.lua")
 
+    @app.get("/minimap-term.lua")
+    def minimap_term_lua():
+        return serve_lua("/app/computercraft/minimap-term.lua")
+
     @app.get("/startup-pocket.lua")
     def startup_pocket_lua():
         return serve_lua("/app/computercraft/startup-pocket.lua")

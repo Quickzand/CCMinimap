@@ -98,6 +98,8 @@ Tune via `minimap.cfg`:
   thrust while turning. Defaults to `false`.
 - `pinHoldEnabled`: set to `false` to disable dropping a map pin by holding
   one spot for about 0.7 seconds. Defaults to `true`.
+- `termMirrorEnabled`: set to `false` to skip launching the local TERM mirror
+  alongside the monitor minimap. Defaults to `true`.
 - `airshipName`, `controlSecret`: pairing values (see below)
 
 ## Pocket

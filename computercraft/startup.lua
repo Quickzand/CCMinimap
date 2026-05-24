@@ -56,6 +56,7 @@ end
 
 -- 2. Update minimap.lua in place (not yet loaded, so no reboot needed).
 syncFile("minimap.lua")
+syncFile("minimap-term.lua")
 syncFile("minimap/cache.lua")
 syncFile("minimap/lift.lua")
 syncFile("minimap/altitude.lua")
@@ -76,13 +77,13 @@ local Cfg = dofile("minimap/cfgutil.lua")
 -- layout (compact configs from earlier builds get auto-beautified) and lets
 -- new nested defaults (e.g. a new channel) propagate to existing configs.
 local defaults = fetchJson(SERVER .. "/config.defaults")
+local current = nil
+local raw = readFile(CONFIG)
+if raw then
+  local ok, parsed = pcall(textutils.unserialiseJSON, raw)
+  if ok and type(parsed) == "table" then current = parsed end
+end
 if type(defaults) == "table" then
-  local raw = readFile(CONFIG)
-  local current = nil
-  if raw then
-    local ok, parsed = pcall(textutils.unserialiseJSON, raw)
-    if ok and type(parsed) == "table" then current = parsed end
-  end
   current = current or {}
   local added = Cfg.deepMergeMissing(defaults, current)
   local serialized = Cfg.jsonPretty(current) .. "\n"
@@ -93,6 +94,7 @@ if type(defaults) == "table" then
     end
   end
 end
+current = current or {}
 
 -- 4. Shell autocomplete for `minimap <subcommand> [args]`. Registered before
 -- minimap launches so the prompt has completions available immediately.
@@ -134,4 +136,7 @@ if minimapPath then
 end
 
 shell.run("bg", "minimap")
+if current.termMirrorEnabled ~= false then
+  shell.run("bg", "minimap-term")
+end
 shell.run("bg", "chatctl")

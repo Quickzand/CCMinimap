@@ -3,15 +3,17 @@
 -- what startup.lua runs in the background) falls through to the display
 -- program below.
 local _cliArgs = { ... }
-if #_cliArgs > 0 then
+local IS_TERM_CLIENT = (_cliArgs[1] == "--term-client")
+if #_cliArgs > 0 and not IS_TERM_CLIENT then
   return shell.run("ship", table.unpack(_cliArgs))
 end
 
--- This file runs as both the ship-side minimap (full autopilot) and the pocket
--- client (thin remote that mirrors state and forwards taps over rednet). The
--- branch point is `IS_POCKET = pocket ~= nil`. The server hosts the file at
--- /minimap.lua (ship) and /minimap-pocket.lua (pocket) -- same content.
+-- This file runs as the ship-side minimap (full autopilot), the pocket client
+-- (remote state over rednet), and the local TERM mirror (state/commands over
+-- os.queueEvent). The server hosts the file at /minimap.lua (ship) and
+-- /minimap-pocket.lua (pocket); minimap-term.lua is a tiny local-client shim.
 local IS_POCKET = pocket ~= nil
+local IS_CLIENT = IS_POCKET or IS_TERM_CLIENT
 local CONFIG_FILE = IS_POCKET and "minimap-pocket.cfg" or "minimap.cfg"
 -- __SERVER_URL__ and __PLAYER_NAME__ are substituted by the server (app.py)
 -- from the CLIENT_SERVER_URL / CLIENT_PLAYER_NAME env vars at serve time.
@@ -121,6 +123,7 @@ if not fs.exists(CONFIG_FILE) then
   "liftPulseSeconds": 0.2,
   "landRampSeconds": 2.0,
   "chatControlEnabled": false,
+  "termMirrorEnabled": true,
   "playerName": "",
   "airshipName": "main",
   "labelMode": "always",
@@ -176,7 +179,7 @@ local Sha = dofile("minimap/sha256.lua")
 
 -- Ship migration: if a legacy plaintext controlSecret still exists on disk,
 -- hash it into controlSecretHash and strip the plaintext. One-shot per ship.
-if not IS_POCKET and CONTROL_SECRET ~= "" then
+if not IS_CLIENT and CONTROL_SECRET ~= "" then
   CONTROL_SECRET_HASH = Sha.hash(CONTROL_SECRET)
   cfg.controlSecretHash = CONTROL_SECRET_HASH
   cfg.controlSecret = nil
@@ -288,11 +291,11 @@ end
 -- rig uses (liftUp/liftDown pulse channels + liftLevel analog feedback). The
 -- module is shared with Spruce, which uses a direct-output variant for cheap
 -- drones. minimap.lua talks to it through commandLevel/currentLevel/idle.
--- Pocket has no relays so it skips the load entirely.
+-- Clients have no relays so they skip the load entirely.
 local Lift
 local Altitude
 local Cfg  -- only used on the ship for Settings -> cfg writeback
-if not IS_POCKET then
+if not IS_CLIENT then
   Lift = dofile("minimap/lift.lua")
   Altitude = dofile("minimap/altitude.lua")
   Cfg = dofile("minimap/cfgutil.lua")
@@ -305,15 +308,15 @@ if not IS_POCKET then
   })
 end
 
-local altSensor = peripheral.find("altitude_sensor")
-local velSensor = peripheral.find("velocity_sensor")
+local altSensor = (not IS_CLIENT) and peripheral.find("altitude_sensor") or nil
+local velSensor = (not IS_CLIENT) and peripheral.find("velocity_sensor") or nil
 
 -- Modem for ship<->pocket rednet. Must be a WIRELESS (or ender) modem -- a
 -- wired modem with `isWireless()=false` would happily open but never reach the
 -- pocket. The ship often has both kinds attached (wired for the relay
 -- network, wireless for control), so filter explicitly.
 local modemName
-do
+if not IS_TERM_CLIENT then
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
       local m = peripheral.wrap(name)
@@ -326,7 +329,7 @@ do
   end
 end
 local SHIP_HOSTNAME = SHIP_HOST .. "-" .. AIRSHIP_NAME
-if modemName and not IS_POCKET then
+if modemName and not IS_CLIENT then
   pcall(rednet.host, SHIP_PROTO, SHIP_HOSTNAME)
 end
 
@@ -390,7 +393,7 @@ end
 -- Ship-side: write current SETTINGS values back to the cfg file via cfgutil.
 -- Pocket never reaches this path (setting_save is forwarded to the ship).
 local function saveSettings()
-  if IS_POCKET then return false end
+  if IS_CLIENT then return false end
   for _, s in ipairs(SETTINGS) do cfg[s.cfgKey] = s.get() end
   local f = fs.open(CONFIG_FILE, "w")
   if not f then return false end
@@ -504,8 +507,10 @@ local state = {
   peerShips = {},
 }
 local buttons = {}
+if IS_TERM_CLIENT then state.shipId = 0 end
 
 local function findMonitor()
+  if IS_TERM_CLIENT then return term.current() end
   local m = peripheral.find("monitor")
   if m then return m end
   return term.current()
@@ -517,13 +522,14 @@ local width, height = monitor.getSize()
 local unpackValues = table.unpack or unpack
 
 -- The pocket has a tight 26x20 screen, so its OSD uses two rows: buttons on
--- height-1, coord/status on height. The ship's monitor keeps the one-row OSD.
+-- height-1, coord/status on height. The local TERM mirror uses the same compact
+-- layout. The ship's monitor keeps the one-row OSD.
 local function mapHeight()
-  return math.max(3, height - (IS_POCKET and 2 or 1))
+  return math.max(3, height - (IS_CLIENT and 2 or 1))
 end
 
 local function isStale()
-  return IS_POCKET and (os.clock() - (state.lastUpdateAt or 0)) > STATE_STALE_AFTER
+  return IS_CLIENT and (os.clock() - (state.lastUpdateAt or 0)) > STATE_STALE_AFTER
 end
 
 local function clamp(v, lo, hi)
@@ -583,7 +589,8 @@ local function discoverNav()
   return nil, nil
 end
 
-local nav, navMethod = discoverNav()
+local nav, navMethod = nil, nil
+if not IS_CLIENT then nav, navMethod = discoverNav() end
 
 local function readHeading()
   if not nav then return nil end
@@ -2105,7 +2112,7 @@ end
 
 local function drawOsd(x, y, z)
   local btnRow, coordRow
-  if IS_POCKET then
+  if IS_CLIENT then
     btnRow   = height - 1
     coordRow = height
     monitor.setCursorPos(1, btnRow);   monitor.setBackgroundColor(colors.black); monitor.clearLine()
@@ -2130,7 +2137,7 @@ local function drawOsd(x, y, z)
     drawButton("zoom_out", col, btnRow, " - "); col = col + 3
     drawButton("zoom_in",  col, btnRow, " + "); col = col + 3
     local panned = state.panAnchorX ~= nil
-    if IS_POCKET then
+    if IS_CLIENT then
       -- Pocket bar is too narrow for L2 + PIN + CTR; the L2 slot becomes a
       -- recenter button instead. Always drawn so the bar layout stays stable;
       -- cyan when there's a pan to undo, lightGray (inert-looking) when not.
@@ -2144,7 +2151,7 @@ local function drawOsd(x, y, z)
     local pinBg = state.pinArmed and colors.yellow or colors.lightGray
     drawButton("pin_arm_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
     -- Full CTR button only on monitor (pocket already has the R slot above).
-    if not IS_POCKET and panned then
+    if not IS_CLIENT and panned then
       drawButton("recenter", col, btnRow, " CTR ", colors.black, colors.cyan); col = col + 5
     end
     if state.target then
@@ -2154,7 +2161,7 @@ local function drawOsd(x, y, z)
       drawButton("auto", col, btnRow, autoLabel, colors.black, autoBg); col = col + #autoLabel
       drawButton("clear_target", col, btnRow, " X "); col = col + 3
     end
-    if not IS_POCKET and state.autoStatus and state.autoStatus ~= "" then
+    if not IS_CLIENT and state.autoStatus and state.autoStatus ~= "" then
       local sfg, sbg = autoStatusColor(state.autoStatus)
       local label = " " .. state.autoStatus .. " "
       drawText(col + 1, btnRow, label, sfg, sbg)
@@ -2163,7 +2170,7 @@ local function drawOsd(x, y, z)
     local headingStr = (state.shipHeading and tostring(math.floor((state.shipHeading or 0) + 0.5))) or "--"
     local pCount = #(state.players or {})
     local pInfo  = "P" .. pCount
-    if not IS_POCKET and state.hasMap and state.lastPos and state.players[1] and state.players[1].position then
+    if not IS_CLIENT and state.hasMap and state.lastPos and state.players[1] and state.players[1].position then
       local pp = state.players[1]
       local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapHeight())
       pInfo = pInfo .. ":" .. pcol .. "," .. prow
@@ -2198,7 +2205,7 @@ local function drawOsd(x, y, z)
       if state.burnerLevel then segs[#segs+1] = { " Bn" .. state.burnerLevel,                           colors.white } end
       if isStale()         then segs[#segs+1] = { " STALE",                                             colors.red   } end
     end
-    if IS_POCKET then
+    if IS_CLIENT then
       drawSegments(1, coordRow, segs)
     else
       local totalLen = 0
@@ -2316,7 +2323,7 @@ local function fullRedraw()
       overlayMarkerLabels(cx, cz, mapH)
       overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
       overlayAltitudeTape(mapH)
-      if not IS_POCKET then overlaySpeedDial(mapH) end
+      if not IS_CLIENT then overlaySpeedDial(mapH) end
     else
       clearMapArea(mapH)
     end
@@ -2333,7 +2340,7 @@ end
 local MapCache = dofile("minimap/cache.lua").init({
   state = state,
   server = SERVER,
-  isPocket = IS_POCKET,
+  isPocket = IS_CLIENT,
   sidecarInterval = SIDECAR_INTERVAL,
   frontierSidecarInterval = FRONTIER_SIDECAR_INTERVAL,
   groundChunkRadius = GROUND_CHUNK_RADIUS,
@@ -2386,7 +2393,7 @@ local function mapLoop()
 end
 
 local function fastTick()
-  if not IS_POCKET then
+  if not IS_CLIENT then
     local h = readHeading()
     if h then state.shipHeading = h end
     state.altitude = readAltitude()
@@ -2415,7 +2422,7 @@ local function fastTick()
       overlayMarkerLabels(fcx, fcz, mapH)
       overlaySelfTriangle(state.shipHeading, mapH, fcx, fcz)
       overlayAltitudeTape(mapH)
-      if not IS_POCKET then overlaySpeedDial(mapH) end
+      if not IS_CLIENT then overlaySpeedDial(mapH) end
     elseif state.screen == "controls" then
       drawControlsScreen(mapH)
     end
@@ -2754,13 +2761,16 @@ local LOCAL_CMDS = {
 }
 
 -- Pocket forwards every command to the ship over rednet, signed with the
--- shared secret. Ship applies locally.
+-- shared secret. The local TERM mirror queues the same local event that the
+-- CLI uses, leaving the ship-side minimap as the only controller.
 local function dispatchCommand(cmd)
   if LOCAL_CMDS[cmd.cmd] then
     applyCommand(cmd)
     return
   end
-  if IS_POCKET then
+  if IS_TERM_CLIENT then
+    os.queueEvent("ship_cmd", cmd)
+  elseif IS_POCKET then
     if state.shipId then
       cmd.secret = CONTROL_SECRET
       pcall(rednet.send, state.shipId, cmd, CMD_PROTOCOL)
@@ -2947,7 +2957,54 @@ local function stateSnapshot()
     settingsSaved   = SETTINGS_SAVED,   -- so pocket can flag dirty/clean accurately
     customControls     = state.customControls,
     customControlsMeta = CUSTOM_CONTROLS, -- schema so pocket renders the ship's actual control list
+    peerShips          = state.peerShips,
   }
+end
+
+local function applyClientState(msg)
+  if type(msg) ~= "table" then return end
+  if msg.lastPos then state.lastPos = msg.lastPos end
+  state.shipHeading   = msg.shipHeading or state.shipHeading
+  state.altitude      = msg.altitude
+  state.burnerLevel   = msg.burnerLevel
+  state.velocity      = msg.velocity
+  state.vy            = msg.vy
+  state.groundY       = msg.groundY
+  local oldTarget, newTarget = state.target, msg.target
+  local targetChanged = (oldTarget == nil) ~= (newTarget == nil)
+      or (oldTarget and newTarget and (
+        oldTarget.x ~= newTarget.x or oldTarget.z ~= newTarget.z
+        or oldTarget.name ~= newTarget.name or oldTarget.kind ~= newTarget.kind
+      ))
+  state.target        = msg.target
+  if targetChanged then os.queueEvent("map_dirty") end
+  state.engaged       = msg.engaged
+  state.altHoldActive = msg.altHoldActive
+  state.altHoldTarget = msg.altHoldTarget
+  state.aglHoldActive = msg.aglHoldActive
+  state.aglHoldOffset = msg.aglHoldOffset
+  if msg.altStep then state.altStep = msg.altStep end
+  state.burnerTarget  = msg.burnerTarget
+  state.phase         = msg.phase
+  state.autoStatus    = msg.autoStatus or ""
+  state.heightMissingTiles = tonumber(msg.heightMissingTiles) or 0
+  if type(msg.peerShips) == "table" then state.peerShips = msg.peerShips end
+  -- bpp/lod are local rendering settings; don't let the ship snapshot
+  -- overwrite a client's own zoom level.
+  if msg.cruiseAltAgl   then CRUISE_ALT_AGL        = msg.cruiseAltAgl   end
+  if msg.minAltAgl      then MIN_ALT_AGL           = msg.minAltAgl      end
+  if msg.followAltAgl   then FOLLOW_ALT_AGL        = msg.followAltAgl   end
+  if msg.hoverBurner    then HOVER_BURNER          = msg.hoverBurner    end
+  if msg.maxSpeed       then MAX_SPEED             = msg.maxSpeed       end
+  if msg.maxAlt         then MAX_ALT               = msg.maxAlt         end
+  if type(msg.customControls) == "table" then state.customControls = msg.customControls end
+  if type(msg.customControlsMeta) == "table" then CUSTOM_CONTROLS = msg.customControlsMeta end
+  if type(msg.settingsSaved) == "table" then
+    for i = 1, #SETTINGS do
+      if msg.settingsSaved[i] ~= nil then SETTINGS_SAVED[i] = msg.settingsSaved[i] end
+    end
+  end
+  state.lastUpdateAt = os.clock()
 end
 
 local function eventLoop()
@@ -2998,17 +3055,27 @@ local function eventLoop()
     elseif event[1] == "ship_cmd" and type(event[2]) == "table" then
       -- Local CLI on the same computer. On the ship we apply directly; on
       -- the pocket we hop through dispatchCommand so it forwards over rednet.
-      if IS_POCKET then dispatchCommand(event[2]) else applyCommand(event[2]) end
+      -- The local TERM mirror ignores this event; otherwise it would re-queue
+      -- commands that it just sent to the ship controller.
+      if IS_TERM_CLIENT then
+        -- no-op
+      elseif IS_POCKET then
+        dispatchCommand(event[2])
+      else
+        applyCommand(event[2])
+      end
     elseif event[1] == "ship_state_request" then
-      os.queueEvent("ship_state_response", stateSnapshot())
+      if not IS_TERM_CLIENT then os.queueEvent("ship_state_response", stateSnapshot(), event[2]) end
     elseif event[1] == "ship_waypoints_request" then
       -- Used by the shell autocompleter for `minimap wp <name>`. Just names,
       -- no coords, since the completer only ranks/filters strings.
-      local names = {}
-      for _, wp in ipairs(state.waypoints or {}) do
-        if type(wp.name) == "string" then names[#names + 1] = wp.name end
+      if not IS_TERM_CLIENT then
+        local names = {}
+        for _, wp in ipairs(state.waypoints or {}) do
+          if type(wp.name) == "string" then names[#names + 1] = wp.name end
+        end
+        os.queueEvent("ship_waypoints_response", names)
       end
-      os.queueEvent("ship_waypoints_response", names)
     end
   end
 end
@@ -3079,49 +3146,7 @@ local function rednetLoop()
           os.queueEvent("map_dirty")  -- repaint peer chevron without waiting for mapTick
         end
         evictStalePeers()
-        if id == state.shipId and type(msg) == "table" then
-          if msg.lastPos then state.lastPos = msg.lastPos end
-          state.shipHeading   = msg.shipHeading or state.shipHeading
-          state.altitude      = msg.altitude
-          state.burnerLevel   = msg.burnerLevel
-          state.velocity      = msg.velocity
-          state.vy            = msg.vy
-          state.groundY       = msg.groundY
-          -- Detect target identity change so the pocket redraws immediately
-          -- when the ship confirms a tap-placed pin (without this the new
-          -- pin marker only appears at the next mapTick).
-          local _ot, _nt = state.target, msg.target
-          local _targetChanged = (_ot == nil) ~= (_nt == nil)
-              or (_ot and _nt and (_ot.x ~= _nt.x or _ot.z ~= _nt.z or _ot.name ~= _nt.name or _ot.kind ~= _nt.kind))
-          state.target        = msg.target
-          if _targetChanged then os.queueEvent("map_dirty") end
-          state.engaged       = msg.engaged
-          state.altHoldActive = msg.altHoldActive
-          state.altHoldTarget = msg.altHoldTarget
-          state.aglHoldActive = msg.aglHoldActive
-          state.aglHoldOffset = msg.aglHoldOffset
-          if msg.altStep then state.altStep = msg.altStep end
-          state.burnerTarget  = msg.burnerTarget
-          state.phase         = msg.phase
-          state.autoStatus    = msg.autoStatus or ""
-          state.heightMissingTiles = tonumber(msg.heightMissingTiles) or 0
-          -- bpp/lod are local rendering settings; don't let the ship broadcast
-          -- overwrite the pocket's own zoom level.
-          if msg.cruiseAltAgl   then CRUISE_ALT_AGL        = msg.cruiseAltAgl   end
-          if msg.minAltAgl      then MIN_ALT_AGL           = msg.minAltAgl      end
-          if msg.followAltAgl   then FOLLOW_ALT_AGL        = msg.followAltAgl   end
-          if msg.hoverBurner    then HOVER_BURNER          = msg.hoverBurner    end
-          if msg.maxSpeed       then MAX_SPEED             = msg.maxSpeed       end
-          if msg.maxAlt         then MAX_ALT               = msg.maxAlt         end
-          if type(msg.customControls) == "table" then state.customControls = msg.customControls end
-          if type(msg.customControlsMeta) == "table" then CUSTOM_CONTROLS = msg.customControlsMeta end
-          if type(msg.settingsSaved) == "table" then
-            for i = 1, #SETTINGS do
-              if msg.settingsSaved[i] ~= nil then SETTINGS_SAVED[i] = msg.settingsSaved[i] end
-            end
-          end
-          state.lastUpdateAt = os.clock()
-        end
+        if id == state.shipId and type(msg) == "table" then applyClientState(msg) end
       end
     end
   else
@@ -3146,8 +3171,29 @@ local function rednetLoop()
   end
 end
 
+local function localStateLoop()
+  local seq = 0
+  while state.running do
+    seq = seq + 1
+    local reqId = "term-" .. tostring(seq)
+    os.queueEvent("ship_state_request", reqId)
+    local deadline = os.startTimer(0.5)
+    while true do
+      local ev, p1, p2 = os.pullEvent()
+      if ev == "ship_state_response" and p2 == reqId then
+        applyClientState(p1)
+        os.cancelTimer(deadline)
+        break
+      elseif ev == "timer" and p1 == deadline then
+        break
+      end
+    end
+    sleep(STATE_BROADCAST_INTERVAL)
+  end
+end
+
 local function resetAllOutputs()
-  if IS_POCKET then return end
+  if IS_CLIENT then return end
   for name in pairs(CHANNELS) do setControl(name, false) end
   Lift.reset()
 end
@@ -3155,7 +3201,7 @@ end
 -- Persist / restore the controls that have physical side-effects so a reboot
 -- doesn't leave relays in an unknown state.  Only runs on the ship.
 saveControlState = function()
-  if IS_POCKET then return end
+  if IS_CLIENT then return end
   local ok, data = pcall(textutils.serialiseJSON, {
     customControls = state.customControls,
     altHoldActive  = state.altHoldActive,
@@ -3174,7 +3220,7 @@ saveControlState = function()
 end
 
 loadControlState = function()
-  if IS_POCKET then return end
+  if IS_CLIENT then return end
   if not fs.exists("controls.state") then return end
   local f = fs.open("controls.state", "r")
   local raw = f.readAll()
@@ -3232,7 +3278,9 @@ monitor.clear()
 resetAllOutputs()
 -- Restore persisted control state AFTER the reset so saved relay states win.
 loadControlState()
-if modemName then
+if IS_TERM_CLIENT then
+  parallel.waitForAny(mapLoop, fastLoop, eventLoop, localStateLoop)
+elseif modemName then
   parallel.waitForAny(mapLoop, fastLoop, eventLoop, rednetLoop)
 else
   parallel.waitForAny(mapLoop, fastLoop, eventLoop)
