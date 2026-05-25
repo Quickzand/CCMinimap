@@ -179,10 +179,6 @@ if CALLSIGN_LEN > 16 then CALLSIGN_LEN = 16 end
 local AIRSHIP_NAME       = tostring(cfg.airshipName or "main")
 local CONTROL_SECRET     = tostring(cfg.controlSecret or "")
 local CONTROL_SECRET_HASH = tostring(cfg.controlSecretHash or "")
-local PLAYER_DETECTOR_PERIPHERAL = tostring(cfg.playerDetectorPeripheral or "")
-local LOOK_RAY_MAX_DISTANCE = tonumber(cfg.lookRayMaxDistance) or 128
-local LOOK_RAY_STEP = tonumber(cfg.lookRayStep) or 2
-local LOOK_RAY_SEA_LEVEL = tonumber(cfg.lookRaySeaLevel) or 64
 local Sha = dofile("minimap/sha256.lua")
 
 -- Ship migration: if a legacy plaintext controlSecret still exists on disk,
@@ -303,12 +299,10 @@ end
 local Lift
 local Altitude
 local LookRay
-local LookRayModule
 local Cfg  -- only used on the ship for Settings -> cfg writeback
 if not IS_CLIENT then
   Lift = dofile("minimap/lift.lua")
   Altitude = dofile("minimap/altitude.lua")
-  LookRayModule = dofile("minimap/lookray.lua")
   Cfg = dofile("minimap/cfgutil.lua")
   Lift.init({
     mode = LIFT_MODE,
@@ -373,7 +367,8 @@ local CLIMB_DONE_MARGIN = 5    -- blocks below cruise that count as "arrived at 
 local RECOVER_MARGIN    = 10   -- exit STOP_AND_RISE this many blocks above MIN_ALT_AGL
 local LANDED_ALT_MARGIN = 2    -- |alt - groundY| < this and |vy| small = landed
 local LANDED_VY_THRESH  = 0.1
-local SETTINGS = {
+local Settings = { saved = {} }
+Settings.items = {
   { name = "Cruise AGL", cfgKey = "cruiseAltitudeAboveGround", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
   { name = "Min AGL",    cfgKey = "minAltitudeAboveGround",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
   { name = "Follow AGL", cfgKey = "followAltitudeAboveGround", get = function() return FOLLOW_ALT_AGL end, set = function(v) FOLLOW_ALT_AGL = v end, step = 5,  min = 5,   max = 200 },
@@ -388,35 +383,34 @@ local SETTINGS = {
 
 -- Last-persisted snapshot for the Cancel button. Captured at boot from the
 -- cfg-loaded values; refreshed on every successful Save.
-local SETTINGS_SAVED = {}
-local function captureSettingsSaved()
-  for i, s in ipairs(SETTINGS) do SETTINGS_SAVED[i] = s.get() end
+Settings.capture = function()
+  for i, s in ipairs(Settings.items) do Settings.saved[i] = s.get() end
 end
-captureSettingsSaved()
+Settings.capture()
 
-local function settingsDirty()
-  for i, s in ipairs(SETTINGS) do
-    if s.get() ~= SETTINGS_SAVED[i] then return true end
+Settings.dirty = function()
+  for i, s in ipairs(Settings.items) do
+    if s.get() ~= Settings.saved[i] then return true end
   end
   return false
 end
 
--- Ship-side: write current SETTINGS values back to the cfg file via cfgutil.
+-- Ship-side: write current Settings values back to the cfg file via cfgutil.
 -- Pocket never reaches this path (setting_save is forwarded to the ship).
-local function saveSettings()
+Settings.save = function()
   if IS_CLIENT then return false end
-  for _, s in ipairs(SETTINGS) do cfg[s.cfgKey] = s.get() end
+  for _, s in ipairs(Settings.items) do cfg[s.cfgKey] = s.get() end
   local f = fs.open(CONFIG_FILE, "w")
   if not f then return false end
   f.write(Cfg.jsonPretty(cfg) .. "\n")
   f.close()
-  captureSettingsSaved()
+  Settings.capture()
   return true
 end
 
-local function cancelSettings()
-  for i, s in ipairs(SETTINGS) do
-    if SETTINGS_SAVED[i] ~= nil then s.set(SETTINGS_SAVED[i]) end
+Settings.cancel = function()
+  for i, s in ipairs(Settings.items) do
+    if Settings.saved[i] ~= nil then s.set(Settings.saved[i]) end
   end
 end
 
@@ -571,13 +565,13 @@ local function httpGetJson(url)
   return parsed, nil
 end
 
-if LookRayModule then
-  LookRay = LookRayModule.init({
+if not IS_CLIENT then
+  LookRay = dofile("minimap/lookray.lua").init({
     playerName = PLAYER_NAME,
-    playerDetectorPeripheral = PLAYER_DETECTOR_PERIPHERAL,
-    maxDistance = LOOK_RAY_MAX_DISTANCE,
-    step = LOOK_RAY_STEP,
-    seaLevel = LOOK_RAY_SEA_LEVEL,
+    playerDetectorPeripheral = tostring(cfg.playerDetectorPeripheral or ""),
+    maxDistance = tonumber(cfg.lookRayMaxDistance) or 128,
+    step = tonumber(cfg.lookRayStep) or 2,
+    seaLevel = tonumber(cfg.lookRaySeaLevel) or 64,
     players = function()
       local feed = httpGetJson(SERVER .. "/players")
       if feed and type(feed.players) == "table" then state.players = feed.players end
@@ -2051,14 +2045,14 @@ local function drawSettingsScreen(mapH)
   state.targetCells = {}
   monitor.setCursorPos(1, 1)
   monitor.setTextColor(colors.yellow); monitor.setBackgroundColor(colors.black)
-  local dirty = settingsDirty()
+  local dirty = Settings.dirty()
   monitor.write(dirty and "SETTINGS *" or "SETTINGS")
   local lastRow = 1
-  for i, s in ipairs(SETTINGS) do
+  for i, s in ipairs(Settings.items) do
     local row = i + 1
     if row > mapH then break end
     local selected = state.settingIdx == i
-    local changed  = s.get() ~= SETTINGS_SAVED[i]
+    local changed  = s.get() ~= Settings.saved[i]
     local bg  = selected and colors.gray or colors.black
     local nfg = selected and colors.white or colors.lightGray
     local vfg = changed and colors.orange or (selected and colors.yellow or colors.white)
@@ -2295,7 +2289,7 @@ local function drawOsd(x, y, z)
   elseif state.screen == "settings" then
     drawButton("setting_dec",  col, btnRow, " - "); col = col + 3
     drawButton("setting_inc",  col, btnRow, " + "); col = col + 3
-    local s = SETTINGS[state.settingIdx]
+    local s = Settings.items[state.settingIdx]
     if s then
       local info = s.name .. ": " .. tostring(s.get())
       if width - #info + 1 > col then
@@ -2778,12 +2772,12 @@ local function applyCommand(cmd)
 
   elseif id == "setting_select" then
     local idx = tonumber(cmd.idx)
-    if idx and idx >= 1 and idx <= #SETTINGS then
+    if idx and idx >= 1 and idx <= #Settings.items then
       state.settingIdx = idx
       if state.screen == "settings" then fullRedraw() end
     end
   elseif id == "setting_inc" then
-    local s = SETTINGS[cmd.idx or state.settingIdx]
+    local s = Settings.items[cmd.idx or state.settingIdx]
     if s then
       if s.values then
         local cur, idx = s.get(), 1
@@ -2795,7 +2789,7 @@ local function applyCommand(cmd)
     end
     if state.screen == "settings" then fullRedraw() end
   elseif id == "setting_dec" then
-    local s = SETTINGS[cmd.idx or state.settingIdx]
+    local s = Settings.items[cmd.idx or state.settingIdx]
     if s then
       if s.values then
         local cur, idx = s.get(), 1
@@ -2807,10 +2801,10 @@ local function applyCommand(cmd)
     end
     if state.screen == "settings" then fullRedraw() end
   elseif id == "setting_save" then
-    saveSettings()
+    Settings.save()
     if state.screen == "settings" then fullRedraw() end
   elseif id == "setting_cancel" then
-    cancelSettings()
+    Settings.cancel()
     if state.screen == "settings" then fullRedraw() end
   end
 end
@@ -3019,7 +3013,7 @@ local function stateSnapshot()
     hoverBurner     = HOVER_BURNER,
     maxSpeed        = MAX_SPEED,
     maxAlt          = MAX_ALT,
-    settingsSaved   = SETTINGS_SAVED,   -- so pocket can flag dirty/clean accurately
+    settingsSaved   = Settings.saved,   -- so pocket can flag dirty/clean accurately
     customControls     = state.customControls,
     customControlsMeta = CUSTOM_CONTROLS, -- schema so pocket renders the ship's actual control list
     peerShips          = state.peerShips,
@@ -3065,8 +3059,8 @@ function applyClientState(msg)
   if type(msg.customControls) == "table" then state.customControls = msg.customControls end
   if type(msg.customControlsMeta) == "table" then CUSTOM_CONTROLS = msg.customControlsMeta end
   if type(msg.settingsSaved) == "table" then
-    for i = 1, #SETTINGS do
-      if msg.settingsSaved[i] ~= nil then SETTINGS_SAVED[i] = msg.settingsSaved[i] end
+    for i = 1, #Settings.items do
+      if msg.settingsSaved[i] ~= nil then Settings.saved[i] = msg.settingsSaved[i] end
     end
   end
   state.lastUpdateAt = os.clock()
