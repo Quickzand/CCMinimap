@@ -635,7 +635,7 @@ function state._addLocalWaypoint(kind)
   state.localWaypoints[#state.localWaypoints + 1] = { name = name, x = x, z = z, color = "e", source = "local" }
   if not state._saveLocalWaypoints() then state.lastError = "Waypoint save failed"; return false end
   state._refreshWaypoints()
-  state.lastError = "Saved waypoint " .. name
+  state.lastError = nil
   os.queueEvent("map_dirty")
   return true
 end
@@ -1982,13 +1982,32 @@ local function drawWaypointsScreen(mapH)
     { label = "[ ADD PLAYER POS ]", cmd = "wp_add_player", enabled = (#(state.players or {}) > 0) },
     { label = "[ ADD TARGET POS ]", cmd = "wp_add_target", enabled = state.target ~= nil },
   }
-  local buttonStartRow = math.max(2, mapH - #actionRows + 1)
+  local listStartRow = 2 + #actionRows
+  local actionRow = 2
+  for _, action in ipairs(actionRows) do
+    if actionRow > mapH then break end
+    monitor.setCursorPos(1, actionRow)
+    monitor.setBackgroundColor(colors.black); monitor.clearLine()
+    if action.enabled then
+      monitor.setBackgroundColor(colors.gray)
+      monitor.setTextColor(colors.lightGray); monitor.write("[ ")
+      monitor.setTextColor(colors.yellow); monitor.write("ADD")
+      monitor.setTextColor(colors.lightGray); monitor.write(action.label:sub(6, width - 5))
+    else
+      monitor.setTextColor(colors.gray)
+      monitor.write(action.label:sub(1, width))
+    end
+    table.insert(state.targetCells, {
+      col1 = 1, col2 = math.min(width, #action.label), row = actionRow, cmd = action.cmd,
+    })
+    actionRow = actionRow + 1
+  end
 
-  local visRows = buttonStartRow - 2
+  local visRows = mapH - listStartRow + 1
   for i = 1, visRows do
     local idx  = i + state.wpScroll
     local item = items[idx]
-    local row  = i + 1
+    local row  = i + listStartRow - 1
     if row > mapH then break end
     monitor.setCursorPos(1, row)
     monitor.setBackgroundColor(colors.black); monitor.clearLine()
@@ -2024,19 +2043,6 @@ local function drawWaypointsScreen(mapH)
         color = isPlayer and "b" or paletteHexFor(item.color),
       })
     end
-  end
-
-  local row = buttonStartRow
-  for _, action in ipairs(actionRows) do
-    if row > mapH then break end
-    monitor.setCursorPos(1, row)
-    monitor.setBackgroundColor(colors.black); monitor.clearLine()
-    monitor.setTextColor(action.enabled and colors.white or colors.gray)
-    monitor.write(action.label:sub(1, width))
-    table.insert(state.targetCells, {
-      col1 = 1, col2 = math.min(width, #action.label), row = row, cmd = action.cmd,
-    })
-    row = row + 1
   end
 end
 
