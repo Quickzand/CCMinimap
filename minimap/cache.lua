@@ -23,7 +23,10 @@ function M.init(env)
     local p = env.httpGetJson(env.server .. "/players")
     if p and p.players then state.players = p.players end
     local w = env.httpGetJson(env.server .. "/waypoints")
-    if w then state.waypoints = w end
+    if w then
+      if env.setWaypoints then env.setWaypoints(w)
+      else state.waypoints = w end
+    end
     -- /height is ship-only. Pockets receive groundY from ship state broadcasts.
     if not env.isPocket and state.lastPos then
       local url = string.format("%s/height?x=%s&z=%s&r=%d",

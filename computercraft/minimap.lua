@@ -15,6 +15,7 @@ end
 local IS_POCKET = pocket ~= nil
 IS_CLIENT = IS_POCKET or IS_TERM_CLIENT
 local CONFIG_FILE = IS_POCKET and "minimap-pocket.cfg" or "minimap.cfg"
+LOCAL_WAYPOINTS_FILE = IS_POCKET and "waypoints-pocket.json" or "waypoints-local.json"
 -- __SERVER_URL__ and __PLAYER_NAME__ are substituted by the server (app.py)
 -- from the CLIENT_SERVER_URL / CLIENT_PLAYER_NAME env vars at serve time.
 -- A literal value here only matters for offline editing.
@@ -475,6 +476,8 @@ local state = {
   running = true,
   players = {},
   waypoints = {},
+  serverWaypoints = {},
+  localWaypoints = {},
   sidecarAt = 0,
   frontierMode = false,
   heightMissingTiles = 0,
@@ -578,6 +581,66 @@ local function httpGetJson(url)
   if not parsedOk then return nil, parsed end
   return parsed, nil
 end
+
+function state._refreshWaypoints()
+  state.waypoints = {}
+  for _, wp in ipairs(state.serverWaypoints or {}) do
+    state.waypoints[#state.waypoints + 1] = wp
+  end
+  for _, wp in ipairs(state.localWaypoints or {}) do
+    state.waypoints[#state.waypoints + 1] = wp
+  end
+end
+
+function state._loadLocalWaypoints()
+  if not fs.exists(LOCAL_WAYPOINTS_FILE) then state.localWaypoints = {}; state._refreshWaypoints(); return end
+  local f = fs.open(LOCAL_WAYPOINTS_FILE, "r")
+  local raw = f and f.readAll() or ""
+  if f then f.close() end
+  local ok, parsed = pcall(textutils.unserialiseJSON, raw)
+  state.localWaypoints = (ok and type(parsed) == "table") and parsed or {}
+  state._refreshWaypoints()
+end
+
+function state._saveLocalWaypoints()
+  local ok, data = pcall(textutils.serialiseJSON, state.localWaypoints or {})
+  if not ok then return false end
+  if fs.exists(LOCAL_WAYPOINTS_FILE) then fs.delete(LOCAL_WAYPOINTS_FILE) end
+  local f = fs.open(LOCAL_WAYPOINTS_FILE, "w")
+  if not f then return false end
+  f.write(data)
+  f.close()
+  return true
+end
+
+function state._addLocalWaypoint(kind)
+  local src, prefix
+  if kind == "ship" and state.lastPos then
+    src, prefix = { x = state.lastPos.x, z = state.lastPos.z }, "Ship"
+  elseif kind == "target" and state.target and state.target.x and state.target.z then
+    src, prefix = state.target, (state.target.name or "Target")
+  elseif kind == "player" then
+    local target = (state.target and state.target.kind == "player") and state.target.name or PLAYER_NAME
+    for _, p in ipairs(state.players or {}) do
+      if (target == "" or p.name == target) and p.position then
+        src, prefix = p.position, p.name
+        break
+      end
+    end
+  end
+  if not src then state.lastError = "No waypoint source"; return false end
+  local x, z = math.floor(src.x + 0.5), math.floor(src.z + 0.5)
+  local name = string.format("%s %d,%d", tostring(prefix):sub(1, 12), x, z)
+  state.localWaypoints = state.localWaypoints or {}
+  state.localWaypoints[#state.localWaypoints + 1] = { name = name, x = x, z = z, color = "e", source = "local" }
+  if not state._saveLocalWaypoints() then state.lastError = "Waypoint save failed"; return false end
+  state._refreshWaypoints()
+  state.lastError = "Saved waypoint " .. name
+  os.queueEvent("map_dirty")
+  return true
+end
+
+state._loadLocalWaypoints()
 
 if not IS_CLIENT then
   LookRay = dofile("minimap/lookray.lua").init({
@@ -1914,11 +1977,29 @@ local function drawWaypointsScreen(mapH)
   monitor.write(string.format("WP:%d  Players:%d", wCount, pCount))
 
   state.targetCells = {}
-  local visRows = mapH - 1
+  local actionRows = {
+    { label = "+ SHIP POS",   cmd = "wp_add_ship",   enabled = state.lastPos ~= nil },
+    { label = "+ PLAYER POS", cmd = "wp_add_player", enabled = (#(state.players or {}) > 0) },
+    { label = "+ TARGET POS", cmd = "wp_add_target", enabled = state.target ~= nil },
+  }
+  local listStartRow = 2
+  for _, action in ipairs(actionRows) do
+    if listStartRow > mapH then break end
+    monitor.setCursorPos(1, listStartRow)
+    monitor.setBackgroundColor(colors.black); monitor.clearLine()
+    monitor.setTextColor(action.enabled and colors.lime or colors.gray)
+    monitor.write(action.label:sub(1, width))
+    table.insert(state.targetCells, {
+      col1 = 1, col2 = width, row = listStartRow, cmd = action.cmd,
+    })
+    listStartRow = listStartRow + 1
+  end
+
+  local visRows = mapH - listStartRow + 1
   for i = 1, visRows do
     local idx  = i + state.wpScroll
     local item = items[idx]
-    local row  = i + 1
+    local row  = i + listStartRow - 1
     if row > mapH then break end
     monitor.setCursorPos(1, row)
     monitor.setBackgroundColor(colors.black); monitor.clearLine()
@@ -2268,8 +2349,9 @@ local function drawOsd(x, y, z)
 
   elseif state.screen == "waypoints" then
     local total   = state.wpTotalItems or (#(state.players or {}) + #(state.waypoints or {}))
+    local listRows = math.max(0, mapHeight() - 4)
     local canUp   = state.wpScroll > 0
-    local canDown = state.wpScroll + mapHeight() - 1 < total
+    local canDown = state.wpScroll + listRows < total
     drawButton("wp_scroll_up",   col, btnRow, " ^ ", colors.black, canUp   and colors.lightGray or colors.gray); col = col + 3
     drawButton("wp_scroll_down", col, btnRow, " v ", colors.black, canDown and colors.lightGray or colors.gray); col = col + 3
     if state.target then
@@ -2397,6 +2479,10 @@ local MapCache = dofile("minimap/cache.lua").init({
   frontierSidecarInterval = FRONTIER_SIDECAR_INTERVAL,
   groundChunkRadius = GROUND_CHUNK_RADIUS,
   httpGetJson = httpGetJson,
+  setWaypoints = function(w)
+    state.serverWaypoints = w or {}
+    state._refreshWaypoints()
+  end,
   urlencode = urlencode,
   buildUrl = buildUrl,
   mapHeight = mapHeight,
@@ -2733,8 +2819,18 @@ local function applyCommand(cmd)
     state.wpScroll = math.max(0, state.wpScroll - 1)
   elseif id == "wp_scroll_down" then
     local total = state.wpTotalItems or (#(state.players or {}) + #(state.waypoints or {}))
-    local maxScroll = math.max(0, total - (mapHeight() - 1))
+    local maxScroll = math.max(0, total - math.max(0, mapHeight() - 4))
     state.wpScroll = math.min(maxScroll, state.wpScroll + 1)
+
+  elseif id == "wp_add_ship" then
+    state._addLocalWaypoint("ship")
+    fullRedraw()
+  elseif id == "wp_add_player" then
+    state._addLocalWaypoint("player")
+    fullRedraw()
+  elseif id == "wp_add_target" then
+    state._addLocalWaypoint("target")
+    fullRedraw()
 
   elseif id == "custom_toggle" then
     local name = cmd.name
@@ -2835,6 +2931,7 @@ end
 local LOCAL_CMDS = {
   screen_map=true, screen_waypoints=true, screen_controls=true, screen_settings=true,
   wp_scroll_up=true, wp_scroll_down=true,
+  wp_add_ship=true, wp_add_player=true, wp_add_target=true,
   setting_select=true,
   pin_arm_toggle=true,
   recenter=true,
