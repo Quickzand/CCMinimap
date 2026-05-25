@@ -1,10 +1,16 @@
 local M = {}
 
 local INCOMPLETE_RETRY_S = {2, 5, 10, 15}
+local FRONTIER_RETRY_S = 30
 
 local function incompleteRetryDelay(attempt)
   local idx = math.min(#INCOMPLETE_RETRY_S, math.max(1, attempt or 1))
   return INCOMPLETE_RETRY_S[idx]
+end
+
+local function retryDelay(missing, frontier, attempt)
+  if (frontier or 0) > 0 and (missing or 0) == 0 then return FRONTIER_RETRY_S end
+  return incompleteRetryDelay(attempt)
 end
 
 function M.init(env)
@@ -43,7 +49,13 @@ function M.init(env)
        and state.bpp == fetchBpp and state.lod == fetchLod
        and state.tileW == env.width() and state.tileH == mapH then
       local missing = tonumber(data.missingTiles) or 0
-      local complete = (data.complete == true) or missing == 0
+      local frontier = tonumber(data.frontierPixels) or tonumber(data.transparentPixels) or 0
+      local complete
+      if data.complete ~= nil then
+        complete = (data.complete == true) and missing == 0 and frontier == 0
+      else
+        complete = missing == 0 and frontier == 0
+      end
       local attempt = (existing and existing.retryCount or 0) + 1
       state.tiles[key] = {
         text = data.text,
@@ -51,9 +63,10 @@ function M.init(env)
         bg = data.bg,
         complete = complete,
         missingTiles = missing,
+        frontierPixels = frontier,
         totalTiles = tonumber(data.totalTiles) or 0,
         retryCount = complete and 0 or attempt,
-        nextRetryAt = complete and nil or (now + incompleteRetryDelay(attempt)),
+        nextRetryAt = complete and nil or (now + retryDelay(missing, frontier, attempt)),
         lastFetchAt = now,
       }
       state.hasMap = true
@@ -62,7 +75,7 @@ function M.init(env)
     if existing and existing.complete == false then
       local attempt = (existing.retryCount or 0) + 1
       existing.retryCount = attempt
-      existing.nextRetryAt = now + incompleteRetryDelay(attempt)
+      existing.nextRetryAt = now + retryDelay(existing.missingTiles, existing.frontierPixels, attempt)
       existing.lastFetchAt = now
     end
     if data and data.error then state.lastError = data.error
@@ -115,7 +128,7 @@ function M.init(env)
     end
     local function tileNeedsAttention(ti, tj)
       local tile = state.tiles[env.tileKey(ti, tj)]
-      return not tile or (frontierRetry and shouldRetryTile(ti, tj))
+      return not tile or shouldRetryTile(ti, tj)
     end
 
     if tileNeedsAttention(ci, cj) then

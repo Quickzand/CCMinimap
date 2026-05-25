@@ -104,7 +104,9 @@ def create_app() -> Flask:
                 "bg": bg,
                 "totalTiles": stats.total_tiles,
                 "missingTiles": stats.missing_tiles,
-                "complete": stats.missing_tiles == 0,
+                "frontierPixels": stats.frontier_pixels,
+                "frontier": stats.frontier_pixels > 0,
+                "complete": stats.missing_tiles == 0 and stats.frontier_pixels == 0,
             }
             _frame_cache_put(key, result)
             return jsonify(result)

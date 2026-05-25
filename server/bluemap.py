@@ -28,7 +28,8 @@ class BlueMapConfig:
     map_id: str
     timeout_seconds: float = 10.0
     cache_dir: Path = Path("/tmp/bluemap-minimap-cache")
-    cache_ttl_seconds: float = 86400.0
+    cache_ttl_seconds: float = 3600.0
+    frontier_cache_ttl_seconds: float = 30.0
 
     @classmethod
     def from_env(cls) -> "BlueMapConfig":
@@ -36,7 +37,8 @@ class BlueMapConfig:
         map_id = os.environ.get("BLUEMAP_MAP_ID", "world")
         timeout = float(os.environ.get("BLUEMAP_TIMEOUT_SECONDS", "10"))
         cache_dir = Path(os.environ.get("BLUEMAP_CACHE_DIR", "/tmp/bluemap-minimap-cache"))
-        cache_ttl = float(os.environ.get("BLUEMAP_CACHE_TTL_SECONDS", "86400"))
+        cache_ttl = float(os.environ.get("BLUEMAP_CACHE_TTL_SECONDS", "3600"))
+        frontier_cache_ttl = float(os.environ.get("BLUEMAP_FRONTIER_CACHE_TTL_SECONDS", "30"))
 
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -45,9 +47,12 @@ class BlueMapConfig:
             raise ValueError("BLUEMAP_MAP_ID contains invalid characters")
         if cache_ttl < 0:
             raise ValueError("BLUEMAP_CACHE_TTL_SECONDS must be non-negative")
+        if frontier_cache_ttl < 0:
+            raise ValueError("BLUEMAP_FRONTIER_CACHE_TTL_SECONDS must be non-negative")
 
         return cls(base_url=base_url, map_id=map_id, timeout_seconds=timeout,
-                   cache_dir=cache_dir, cache_ttl_seconds=cache_ttl)
+                   cache_dir=cache_dir, cache_ttl_seconds=cache_ttl,
+                   frontier_cache_ttl_seconds=frontier_cache_ttl)
 
 
 def split_number_to_path(value: int) -> str:
@@ -74,14 +79,21 @@ _TILE_MEM_MAX = 128   # max decoded tiles kept in memory (~2 MB each at LOD1)
 _TILE_MEM_TTL = 60.0  # seconds before a memory-cached tile is considered stale
 
 
+def transparent_color_pixels(image: Image.Image, tile_size: int) -> int:
+    """Count fully transparent pixels in the visible BlueMap color half."""
+    color_half = image.crop((0, 0, tile_size + 1, tile_size + 1))
+    return color_half.getchannel("A").histogram()[0]
+
+
 class BlueMapClient:
     def __init__(self, config: BlueMapConfig):
         self.config = config
         self.session = requests.Session()
         self.config.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lowres: LowresSettings | None = None
-        # In-memory tile cache: key → (timestamp, Image). OrderedDict for LRU eviction.
-        self._tile_mem: OrderedDict[tuple, tuple[float, Image.Image]] = OrderedDict()
+        # In-memory tile cache: key → (timestamp, Image, transparent_pixels).
+        # OrderedDict handles LRU eviction.
+        self._tile_mem: OrderedDict[tuple, tuple[float, Image.Image, int]] = OrderedDict()
 
     @property
     def map_root(self) -> str:
@@ -143,6 +155,11 @@ class BlueMapClient:
                 pass
             raise
 
+    def _cache_ttl_for_tile(self, transparent_pixels: int) -> float:
+        if transparent_pixels > 0:
+            return self.config.frontier_cache_ttl_seconds
+        return self.config.cache_ttl_seconds
+
     def fetch_lowres_tile(self, lod: int, tile_x: int, tile_z: int) -> Image.Image | None:
         lowres = self.lowres_settings()
         if lod < 1 or lod > lowres.lod_count:
@@ -153,8 +170,9 @@ class BlueMapClient:
 
         # Hot memory cache: skip disk and network entirely for recently decoded tiles.
         if mem_key in self._tile_mem:
-            ts, img = self._tile_mem[mem_key]
-            if now - ts < _TILE_MEM_TTL:
+            ts, img, transparent_pixels = self._tile_mem[mem_key]
+            ttl = min(_TILE_MEM_TTL, self._cache_ttl_for_tile(transparent_pixels))
+            if now - ts < ttl:
                 self._tile_mem.move_to_end(mem_key)  # LRU touch
                 return img
             # Stale in memory — fall through to disk/network refresh.
@@ -162,13 +180,20 @@ class BlueMapClient:
         cache_path = self.tile_cache_path(lod, tile_x, tile_z)
         cache_exists = cache_path.exists()
 
-        # Fresh disk cache: decode once and store in memory.
+        cached = None
+        cached_transparent = 0
+
+        # Fresh disk cache: decode once and store in memory. Frontier tiles
+        # (BlueMap color pixels with alpha=0) get a much shorter TTL because
+        # those transparent regions turn into the black unexplored chunks the
+        # CC client sees, and they may become rendered shortly after discovery.
         if cache_exists:
             age = now - cache_path.stat().st_mtime
-            if age < self.config.cache_ttl_seconds:
-                cached = self._read_cached_tile(cache_path)
-                if cached is not None:
-                    self._store_tile_mem(mem_key, now, cached)
+            cached = self._read_cached_tile(cache_path)
+            if cached is not None:
+                cached_transparent = transparent_color_pixels(cached, lowres.tile_size)
+                if age < self._cache_ttl_for_tile(cached_transparent):
+                    self._store_tile_mem(mem_key, now, cached, cached_transparent)
                     return cached
         else:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,37 +209,32 @@ class BlueMapClient:
                 headers={"accept": "image/png"},
             )
             if response.status_code == 404:
-                if cache_exists:
-                    img = self._read_cached_tile(cache_path)
-                    if img is not None:
-                        self._store_tile_mem(mem_key, now, img)
-                    return img
+                if cached is not None:
+                    self._store_tile_mem(mem_key, now, cached, cached_transparent)
+                    return cached
                 return None
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
             if "image/png" not in content_type:
-                if cache_exists:
-                    img = self._read_cached_tile(cache_path)
-                    if img is not None:
-                        self._store_tile_mem(mem_key, now, img)
-                    return img
+                if cached is not None:
+                    self._store_tile_mem(mem_key, now, cached, cached_transparent)
+                    return cached
                 return None
 
             image = Image.open(io.BytesIO(response.content)).convert("RGBA")
+            transparent_pixels = transparent_color_pixels(image, lowres.tile_size)
             self._save_tile_atomic(image, cache_path)
-            self._store_tile_mem(mem_key, now, image)
+            self._store_tile_mem(mem_key, now, image, transparent_pixels)
             return image
         except requests.RequestException:
-            if cache_exists:
-                img = self._read_cached_tile(cache_path)
-                if img is not None:
-                    self._store_tile_mem(mem_key, now, img)
-                return img
+            if cached is not None:
+                self._store_tile_mem(mem_key, now, cached, cached_transparent)
+                return cached
             raise
 
-    def _store_tile_mem(self, key: tuple, ts: float, img: Image.Image) -> None:
+    def _store_tile_mem(self, key: tuple, ts: float, img: Image.Image, transparent_pixels: int) -> None:
         """Insert/update memory cache with LRU eviction at _TILE_MEM_MAX entries."""
-        self._tile_mem[key] = (ts, img)
+        self._tile_mem[key] = (ts, img, transparent_pixels)
         self._tile_mem.move_to_end(key)
         while len(self._tile_mem) > _TILE_MEM_MAX:
             self._tile_mem.popitem(last=False)

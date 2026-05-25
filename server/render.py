@@ -27,6 +27,7 @@ class FrameRequest:
 class RenderStats:
     total_tiles: int
     missing_tiles: int
+    frontier_pixels: int
 
 
 def parse_frame_request(args) -> FrameRequest:
@@ -53,18 +54,30 @@ def parse_frame_request(args) -> FrameRequest:
     )
 
 
-def _paste_tile(client, canvas, lod, tile_x, tile_z, origin_x, origin_z) -> bool:
+def _visible_transparent_pixels(image: Image.Image, px: int, py: int, canvas_size: tuple[int, int]) -> int:
+    canvas_w, canvas_h = canvas_size
+    src_l = max(0, -px)
+    src_t = max(0, -py)
+    src_r = min(image.width, canvas_w - px)
+    src_b = min(image.height, canvas_h - py)
+    if src_l >= src_r or src_t >= src_b:
+        return 0
+    return image.crop((src_l, src_t, src_r, src_b)).getchannel("A").histogram()[0]
+
+
+def _paste_tile(client, canvas, lod, tile_x, tile_z, origin_x, origin_z) -> tuple[bool, int]:
     lowres = client.lowres_settings()
     _, _, _, _, lod_scale = client.world_to_lowres_tile(0, 0, lod)
     tile_world = lowres.tile_size * lod_scale
     tile = client.fetch_lowres_tile(lod, tile_x, tile_z)
     if tile is None:
-        return False
+        return False, 0
     color_half = tile.crop((0, 0, lowres.tile_size + 1, lowres.tile_size + 1))
     px = round((tile_x * tile_world - origin_x) / lod_scale)
     py = round((tile_z * tile_world - origin_z) / lod_scale)
+    frontier_pixels = _visible_transparent_pixels(color_half, px, py, canvas.size)
     canvas.alpha_composite(color_half, (px, py))
-    return True
+    return True, frontier_pixels
 
 
 def render_subpixel_image(client: BlueMapClient, req: FrameRequest) -> tuple[Image.Image, RenderStats]:
@@ -98,17 +111,22 @@ def render_subpixel_image(client: BlueMapClient, req: FrameRequest) -> tuple[Ima
     max_tile_z = math.floor((origin_z + crop_world_h) / tile_world)
     total_tiles = 0
     missing_tiles = 0
+    frontier_pixels = 0
 
     for tz in range(min_tile_z, max_tile_z + 1):
         for tx in range(min_tile_x, max_tile_x + 1):
             total_tiles += 1
-            if not _paste_tile(client, canvas, req.lod, tx, tz, origin_x, origin_z):
+            pasted, transparent = _paste_tile(client, canvas, req.lod, tx, tz, origin_x, origin_z)
+            if not pasted:
                 missing_tiles += 1
+            else:
+                frontier_pixels += transparent
 
     image = canvas.crop((0, 0, source_px_w, source_px_h)).convert("RGB")
     return image.resize((sub_w, sub_h), Image.Resampling.BILINEAR), RenderStats(
         total_tiles=total_tiles,
         missing_tiles=missing_tiles,
+        frontier_pixels=frontier_pixels,
     )
 
 

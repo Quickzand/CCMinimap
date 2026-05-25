@@ -8,11 +8,12 @@ services:
       BLUEMAP_MAP_ID: ${BLUEMAP_MAP_ID:?set BLUEMAP_MAP_ID in .env}
       BLUEMAP_CACHE_DIR: ${BLUEMAP_CACHE_DIR:-/cache}
       BLUEMAP_TIMEOUT_SECONDS: ${BLUEMAP_TIMEOUT_SECONDS:-10}
-      # Cached lowres tiles older than this are refetched from upstream on
-      # the next request. Default 24h; lower it if you actively edit terrain
-      # and want the minimap to reflect changes sooner. Failed refresh keeps
-      # serving the previous cached copy.
-      BLUEMAP_CACHE_TTL_SECONDS: ${BLUEMAP_CACHE_TTL_SECONDS:-86400}
+      # Cached fully-rendered lowres tiles older than this are refetched from
+      # upstream on the next request. Failed refresh keeps serving the previous
+      # cached copy. Frontier tiles with transparent/unrendered BlueMap pixels
+      # use a shorter TTL so newly explored chunks appear quickly.
+      BLUEMAP_CACHE_TTL_SECONDS: ${BLUEMAP_CACHE_TTL_SECONDS:-3600}
+      BLUEMAP_FRONTIER_CACHE_TTL_SECONDS: ${BLUEMAP_FRONTIER_CACHE_TTL_SECONDS:-30}
       # Substituted into served .lua files. CLIENT_SERVER_URL is how the CC
       # computers reach this service from inside Minecraft. CLIENT_PLAYER_NAME
       # is your in-game name, used to skip drawing your own player marker

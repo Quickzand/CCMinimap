@@ -69,6 +69,10 @@ Tab completion is registered on boot for `minimap <sub>` and waypoint names.
 `waypoints.json` is volume-mounted into the container. Format in
 `waypoints.example.json`. Restart the container after editing.
 
+Rendered BlueMap tiles are cached for 1 hour by default. Tiles with transparent
+frontier pixels are cached for 30 seconds so newly explored chunks fill in
+quickly.
+
 ## Ship CC computer
 
 Peripherals (any side, or via wired modems):
@@ -95,6 +99,8 @@ Tune via `minimap.cfg`:
   oscillates; Ki absorbs altitude-dependent burner equilibrium so AUTO doesn't
   stall short of target over high terrain.
 - `cruiseAltitudeAboveGround`: target AGL when AUTO is engaged
+- `seaLevel`, `seaLevelAwareAgl`: floor AGL ground at sea level over water or
+  partially rendered map areas. Defaults to `63` and `true`.
 - `autoExclusiveDrive`: set to `true` to prevent AUTO from commanding forward
   thrust while turning. Defaults to `false`.
 - `pinHoldEnabled`: set to `false` to disable dropping a map pin by holding
