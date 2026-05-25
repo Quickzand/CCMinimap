@@ -60,6 +60,7 @@ syncFile("minimap-term.lua")
 syncFile("minimap/cache.lua")
 syncFile("minimap/lift.lua")
 syncFile("minimap/altitude.lua")
+syncFile("minimap/lookray.lua")
 syncFile("minimap/cfgutil.lua")
 syncFile("minimap/sha256.lua")
 

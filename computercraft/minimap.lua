@@ -302,10 +302,13 @@ end
 -- Clients have no relays so they skip the load entirely.
 local Lift
 local Altitude
+local LookRay
+local LookRayModule
 local Cfg  -- only used on the ship for Settings -> cfg writeback
 if not IS_CLIENT then
   Lift = dofile("minimap/lift.lua")
   Altitude = dofile("minimap/altitude.lua")
+  LookRayModule = dofile("minimap/lookray.lua")
   Cfg = dofile("minimap/cfgutil.lua")
   Lift.init({
     mode = LIFT_MODE,
@@ -568,114 +571,24 @@ local function httpGetJson(url)
   return parsed, nil
 end
 
-local playerDetector
-local function getPlayerDetector()
-  if playerDetector then return playerDetector end
-  if PLAYER_DETECTOR_PERIPHERAL ~= "" then
-    local p = peripheral.wrap(PLAYER_DETECTOR_PERIPHERAL)
-    if p and type(p.getPlayer) == "function" then
-      playerDetector = p
-      return playerDetector
-    end
-  end
-  local p = peripheral.find("player_detector")
-  if p and type(p.getPlayer) == "function" then playerDetector = p end
-  return playerDetector
-end
-
-local function playerFromDetector(name)
-  if not name or name == "" then return nil end
-  local detector = getPlayerDetector()
-  if not detector then return nil end
-  local ok, data = pcall(detector.getPlayer, name)
-  if not ok or type(data) ~= "table" then return nil end
-  if type(data.x) ~= "number" or type(data.z) ~= "number" then return nil end
-  if type(data.yaw) ~= "number" or type(data.pitch) ~= "number" then return nil end
-  return {
-    source = "player_detector",
-    name = name,
-    x = data.x,
-    y = data.y or 0,
-    z = data.z,
-    yaw = data.yaw,
-    pitch = data.pitch,
-  }
-end
-
-local function playerFromBlueMap(name)
-  local feed = httpGetJson(SERVER .. "/players")
-  local players = feed and feed.players
-  if type(players) == "table" then state.players = players else players = state.players or {} end
-  local target = name
-  if not target or target == "" then
-    if PLAYER_NAME ~= "" then target = PLAYER_NAME
-    elseif #players == 1 then target = players[1].name end
-  end
-  if not target or target == "" then return nil, "usage: lookgoto <player> [maxDistance]" end
-  for _, p in ipairs(players) do
-    if p.name == target and type(p.position) == "table" and type(p.rotation) == "table" then
-      if type(p.position.x) == "number" and type(p.position.z) == "number"
-         and type(p.rotation.yaw) == "number" and type(p.rotation.pitch) == "number" then
-        return {
-          source = "bluemap",
-          name = p.name,
-          x = p.position.x,
-          y = p.position.y or 0,
-          z = p.position.z,
-          yaw = p.rotation.yaw,
-          pitch = p.rotation.pitch,
-        }
-      end
-    end
-  end
-  return nil, "lookgoto: missing player yaw/pitch for " .. tostring(target)
-end
-
-local function lookupLookPlayer(name)
-  local target = (name and name ~= "") and name or PLAYER_NAME
-  if target and target ~= "" then return playerFromDetector(target) or playerFromBlueMap(target) end
-  local p, err = playerFromBlueMap(nil)
-  if p and p.name then return playerFromDetector(p.name) or p end
-  return nil, err
-end
-
-local function lookGroundY(x, z)
-  local h = httpGetJson(string.format("%s/height?x=%s&z=%s&rb=0",
-    SERVER, urlencode(x), urlencode(z)))
-  if h and type(h.groundMaxY) == "number" then return h.groundMaxY end
-  return LOOK_RAY_SEA_LEVEL
-end
-
-local function resolveLookTarget(name, maxDistance)
-  local p, err = lookupLookPlayer(name)
-  if not p then return nil, err end
-  local limit = tonumber(maxDistance) or LOOK_RAY_MAX_DISTANCE
-  limit = clamp(limit, 8, 512)
-  local step = clamp(LOOK_RAY_STEP, 0.5, 8)
-  local yaw = math.rad(p.yaw)
-  local pitch = math.rad(p.pitch)
-  local horizontal = math.cos(pitch)
-  local dx = -math.sin(yaw) * horizontal
-  local dy = -math.sin(pitch)
-  local dz = math.cos(yaw) * horizontal
-  local eyeY = (p.y or 0) + 1.62
-  local d = step
-  while d <= limit do
-    local x = p.x + dx * d
-    local y = eyeY + dy * d
-    local z = p.z + dz * d
-    if y <= lookGroundY(x, z) + 1 then
-      return {
-        x = math.floor(x),
-        z = math.floor(z),
-        player = p.name,
-        source = p.source,
-        distance = d,
-      }
-    end
-    d = d + step
-  end
-  return nil, "lookgoto: no terrain hit within " .. math.floor(limit) .. "m"
+if LookRayModule then
+  LookRay = LookRayModule.init({
+    playerName = PLAYER_NAME,
+    playerDetectorPeripheral = PLAYER_DETECTOR_PERIPHERAL,
+    maxDistance = LOOK_RAY_MAX_DISTANCE,
+    step = LOOK_RAY_STEP,
+    seaLevel = LOOK_RAY_SEA_LEVEL,
+    players = function()
+      local feed = httpGetJson(SERVER .. "/players")
+      if feed and type(feed.players) == "table" then state.players = feed.players end
+      return state.players or {}
+    end,
+    groundY = function(x, z)
+      local h = httpGetJson(string.format("%s/height?x=%s&z=%s&rb=0",
+        SERVER, urlencode(x), urlencode(z)))
+      return h and h.groundMaxY
+    end,
+  })
 end
 
 -- Find nav peripheral by type then by method scan; mirrors how peripheral.find("speaker") works.
@@ -2666,7 +2579,12 @@ local function applyCommand(cmd)
     saveControlState()
 
   elseif id == "lookgoto" then
-    local target, err = resolveLookTarget(cmd.name, cmd.maxDistance)
+    local target, err
+    if LookRay then
+      target, err = LookRay.resolve(cmd.name, cmd.maxDistance)
+    else
+      err = "lookgoto unavailable"
+    end
     if target then
       state.target = {
         kind = "cli",

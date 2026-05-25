@@ -59,6 +59,7 @@ end
 syncFile("minimap-pocket.lua", "minimap-pocket.lua")
 syncFile("minimap/cache.lua", "minimap/cache.lua")
 syncFile("minimap/cfgutil.lua", "minimap/cfgutil.lua")
+syncFile("minimap/lookray.lua", "minimap/lookray.lua")
 syncFile("minimap/sha256.lua", "minimap/sha256.lua")
 
 -- 2a. CLI dispatcher. Invoke commands as `minimap <cmd>`; the minimap.lua
