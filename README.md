@@ -42,6 +42,7 @@ shared `controlSecret`. Type `minimap` followed by a subcommand:
 | Command | Action |
 |---|---|
 | `minimap goto X Z` | Autopilot to coordinate X,Z |
+| `minimap look [player] [distance]` | Autopilot to the block a player is looking at; defaults to configured `playerName` and 5000m |
 | `minimap wp <name>` | Autopilot to a named waypoint (tab-completes) |
 | `minimap burner N` | Drive burner to level N (0-15) |
 | `minimap hold [alt]` | Toggle altitude (Y) hold (optional explicit altitude) |

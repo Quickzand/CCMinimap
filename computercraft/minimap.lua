@@ -112,6 +112,8 @@ if not fs.exists(CONFIG_FILE) then
   "pinHoldEnabled": true,
   "velocityFlipped": true,
   "groundSampleChunkRadius": 1,
+  "seaLevel": 63,
+  "seaLevelAwareAgl": true,
   "cruiseAltitudeAboveGround": 50,
   "minAltitudeAboveGround": 20,
   "hoverBurnerLevel": 7,
@@ -126,7 +128,7 @@ if not fs.exists(CONFIG_FILE) then
   "termMirrorEnabled": true,
   "playerName": "",
   "playerDetectorPeripheral": "",
-  "lookRayMaxDistance": 128,
+  "lookRayMaxDistance": 5000,
   "lookRayStep": 2,
   "lookRaySeaLevel": 64,
   "airshipName": "main",
@@ -345,6 +347,10 @@ local MAX_SPEED = tonumber(cfg.maxSpeed) or 5
 local AUTO_EXCLUSIVE_DRIVE = (cfg.autoExclusiveDrive == true)
 local GROUND_CHUNK_RADIUS = math.floor(tonumber(cfg.groundSampleChunkRadius) or 1)
 local VELOCITY_FLIPPED = (cfg.velocityFlipped ~= false)
+local SEA_LEVEL = tonumber(cfg.seaLevel) or 63
+local SEA_LEVEL_AWARE_AGL = (cfg.seaLevelAwareAgl ~= false)
+local LOOK_RAY_MAX_DISTANCE = tonumber(cfg.lookRayMaxDistance) or 5000
+if LOOK_RAY_MAX_DISTANCE == 128 then LOOK_RAY_MAX_DISTANCE = 5000 end
 local CRUISE_ALT_AGL    = tonumber(cfg.cruiseAltitudeAboveGround) or 50
 local MIN_ALT_AGL       = tonumber(cfg.minAltitudeAboveGround) or 20
 -- AGL held when following a player target. Defaults to MIN_ALT_AGL so the
@@ -372,6 +378,8 @@ Settings.items = {
   { name = "Cruise AGL", cfgKey = "cruiseAltitudeAboveGround", get = function() return CRUISE_ALT_AGL end, set = function(v) CRUISE_ALT_AGL = v end, step = 5,  min = 10,  max = 200 },
   { name = "Min AGL",    cfgKey = "minAltitudeAboveGround",    get = function() return MIN_ALT_AGL end,    set = function(v) MIN_ALT_AGL = v end,    step = 5,  min = 5,   max = 100 },
   { name = "Follow AGL", cfgKey = "followAltitudeAboveGround", get = function() return FOLLOW_ALT_AGL end, set = function(v) FOLLOW_ALT_AGL = v end, step = 5,  min = 5,   max = 200 },
+  { name = "Sea Level",  cfgKey = "seaLevel",                   get = function() return SEA_LEVEL end,     set = function(v) SEA_LEVEL = v end,     step = 1,  min = -64, max = 320 },
+  { name = "Sea Aware",  cfgKey = "seaLevelAwareAgl",            get = function() return SEA_LEVEL_AWARE_AGL end, set = function(v) SEA_LEVEL_AWARE_AGL = v end, values = { true, false } },
   { name = "Hover Brn",  cfgKey = "hoverBurnerLevel",          get = function() return HOVER_BURNER end,   set = function(v) HOVER_BURNER = v end,   step = 1,  min = 0,   max = 15  },
   { name = "Max Speed",  cfgKey = "maxSpeed",                  get = function() return MAX_SPEED end,      set = function(v) MAX_SPEED = v end,      step = 1,  min = 1,   max = 20  },
   { name = "Max Alt",    cfgKey = "maxAltitude",               get = function() return MAX_ALT end,        set = function(v) MAX_ALT = v end,        step = 10, min = 64,  max = 320 },
@@ -542,6 +550,12 @@ local function clamp(v, lo, hi)
   return v
 end
 
+local function effectiveGroundY()
+  if not state.groundY then return nil end
+  if SEA_LEVEL_AWARE_AGL and state.groundY < SEA_LEVEL then return SEA_LEVEL end
+  return state.groundY
+end
+
 local function pickLod(bpp)
   if bpp <= 4 then return 1 end
   if bpp <= 24 then return 2 end
@@ -569,7 +583,7 @@ if not IS_CLIENT then
   LookRay = dofile("minimap/lookray.lua").init({
     playerName = PLAYER_NAME,
     playerDetectorPeripheral = tostring(cfg.playerDetectorPeripheral or ""),
-    maxDistance = tonumber(cfg.lookRayMaxDistance) or 128,
+    maxDistance = LOOK_RAY_MAX_DISTANCE,
     step = tonumber(cfg.lookRayStep) or 2,
     seaLevel = tonumber(cfg.lookRaySeaLevel) or 64,
     players = function()
@@ -1145,7 +1159,7 @@ overlayPin = function(cx, cz, mapH)
   local mc = math.max(1, math.min(width - 1, col))
   overlayMarkerDisc(mc, row, "1", mapH)   -- "1" = yellow in the server palette
   if LABEL_MODE == "off" then return end
-  -- CLI goto/lookgoto targets show their resolved coordinate; interactive
+  -- CLI goto/look targets show their resolved coordinate; interactive
   -- pins keep the existing PIN/custom-name behavior.
   local rawName = state.target.name or "Pin"
   local name
@@ -1427,8 +1441,9 @@ overlayAltitudeTape = function(mapH)
   local altRatio = math.max(0, math.min(1, state.altitude / MAX_ALT))
   local altSubY = math.floor((1 - altRatio) * maxSubY + 0.5)
   local groundSubY = nil
-  if state.groundY then
-    local gr = math.max(0, math.min(1, state.groundY / MAX_ALT))
+  local groundY = effectiveGroundY()
+  if groundY then
+    local gr = math.max(0, math.min(1, groundY / MAX_ALT))
     groundSubY = math.floor((1 - gr) * maxSubY + 0.5)
   end
 
@@ -1497,10 +1512,10 @@ overlayAltitudeTape = function(mapH)
     return topRow + math.floor(subY / SUB_H)
   end
   drawTapeLabel(tostring(math.floor(state.altitude + 0.5)), altRow, labelAnchor, mapH)
-  if groundSubY and state.groundY then
+  if groundSubY and groundY then
     local groundRow = labelRow(groundSubY)
     if groundRow ~= altRow then
-      drawTapeLabel(tostring(state.groundY), groundRow, labelAnchor, mapH)
+      drawTapeLabel(tostring(groundY), groundRow, labelAnchor, mapH)
     end
   end
 end
@@ -1669,7 +1684,8 @@ local function updatePhase()
   local dz = (state.target.z or 0) - state.lastPos.z
   local range = math.sqrt(dx * dx + dz * dz)
   local agl
-  if state.altitude and state.groundY then agl = state.altitude - state.groundY end
+  local groundY = effectiveGroundY()
+  if state.altitude and groundY then agl = state.altitude - groundY end
 
   if state.phase == "LAND" then
     if agl and agl < LANDED_ALT_MARGIN and math.abs(state.vy or 0) < LANDED_VY_THRESH then
@@ -1777,14 +1793,17 @@ local function altitudeController()
     if state.altHoldActive then
       targetAlt = state.altHoldTarget
     elseif state.aglHoldActive then
-      if not state.groundY then return end
-      targetAlt = state.groundY + state.aglHoldOffset
-    elseif state.engaged and state.groundY then
+      local groundY = effectiveGroundY()
+      if not groundY then return end
+      targetAlt = groundY + state.aglHoldOffset
+    elseif state.engaged then
+      local groundY = effectiveGroundY()
+      if not groundY then return end
       -- FOLLOW phase holds at the (typically lower) FOLLOW_ALT_AGL so the ship
       -- hovers close enough to actually see the player. Explicit alt/AGL locks
       -- above this branch already take precedence.
       local agl_target = (state.phase == "FOLLOW") and FOLLOW_ALT_AGL or CRUISE_ALT_AGL
-      targetAlt = state.groundY + agl_target
+      targetAlt = groundY + agl_target
     end
     if not targetAlt then return end
 
@@ -1954,9 +1973,10 @@ local function drawControlsScreen(mapH)
     row = row + 1
   end
   local altStr = state.altitude    and string.format("%dm",      math.floor(state.altitude + 0.5))       or "--"
-  local aglStr = (state.altitude and state.groundY)
-                 and string.format("%dm", math.floor(state.altitude - state.groundY + 0.5))              or "--"
-  local gndStr = state.groundY     and string.format("%dm",      state.groundY)                          or "--"
+  local groundY = effectiveGroundY()
+  local aglStr = (state.altitude and groundY)
+                 and string.format("%dm", math.floor(state.altitude - groundY + 0.5))                    or "--"
+  local gndStr = groundY           and string.format("%dm",      groundY)                                or "--"
   local spdStr = state.velocity    and string.format("%.1fm/s",  state.velocity)                         or "--"
   local vyStr  = state.vy          and string.format("%+.1fm/s", state.vy)                               or "--"
   local hdgStr = state.shipHeading and string.format("%d\xb0",   math.floor(state.shipHeading + 0.5))    or "--"
@@ -2520,12 +2540,13 @@ local function applyCommand(cmd)
   elseif id == "agl" then
     -- Toggle AGL lock at current AGL. Requires groundY to compute the offset;
     -- silently bail if unknown so the user can retry once BlueMap responds.
+    local groundY = effectiveGroundY()
     if state.aglHoldActive then
       state.aglHoldActive = false
       state.aglHoldOffset = nil
-    elseif state.altitude and state.groundY then
+    elseif state.altitude and groundY then
       state.aglHoldActive = true
-      state.aglHoldOffset = state.altitude - state.groundY
+      state.aglHoldOffset = state.altitude - groundY
       state.altHoldActive = false
       state.altHoldTarget = nil
     end
@@ -2572,12 +2593,12 @@ local function applyCommand(cmd)
     resetLiftIntegrator()
     saveControlState()
 
-  elseif id == "lookgoto" then
+  elseif id == "look" or id == "lookgoto" then
     local target, err
     if LookRay then
       target, err = LookRay.resolve(cmd.name, cmd.maxDistance)
     else
-      err = "lookgoto unavailable"
+      err = "look unavailable"
     end
     if target then
       state.target = {
@@ -2596,7 +2617,7 @@ local function applyCommand(cmd)
       os.queueEvent("map_dirty")
       saveControlState()
     else
-      state.lastError = err or "lookgoto failed"
+      state.lastError = err or "look failed"
     end
 
   elseif id == "goto_wp" and type(cmd.name) == "string" then
@@ -2670,8 +2691,9 @@ local function applyCommand(cmd)
   elseif id == "agl_set" then
     -- CLI: `minimap agl [N]`. No arg = toggle at current AGL. With arg = lock
     -- at N m above current ground. Requires groundY when engaging.
+    local groundY = effectiveGroundY()
     if type(cmd.offset) == "number" then
-      if state.groundY then
+      if groundY then
         state.aglHoldActive = true
         state.aglHoldOffset = cmd.offset
         state.altHoldActive = false
@@ -2681,9 +2703,9 @@ local function applyCommand(cmd)
     elseif state.aglHoldActive then
       state.aglHoldActive = false
       state.aglHoldOffset = nil
-    elseif state.altitude and state.groundY then
+    elseif state.altitude and groundY then
       state.aglHoldActive = true
-      state.aglHoldOffset = state.altitude - state.groundY
+      state.aglHoldOffset = state.altitude - groundY
       state.altHoldActive = false
       state.altHoldTarget = nil
       state.burnerTarget = nil
@@ -3007,6 +3029,8 @@ local function stateSnapshot()
     heightMissingTiles = state.heightMissingTiles,
     bpp           = state.bpp,
     lod           = state.lod,
+    seaLevel        = SEA_LEVEL,
+    seaLevelAwareAgl = SEA_LEVEL_AWARE_AGL,
     cruiseAltAgl    = CRUISE_ALT_AGL,
     minAltAgl       = MIN_ALT_AGL,
     followAltAgl    = FOLLOW_ALT_AGL,
@@ -3050,6 +3074,8 @@ function applyClientState(msg)
   if type(msg.peerShips) == "table" then state.peerShips = msg.peerShips end
   -- bpp/lod are local rendering settings; don't let the ship snapshot
   -- overwrite a client's own zoom level.
+  if msg.seaLevel ~= nil then SEA_LEVEL = msg.seaLevel end
+  if msg.seaLevelAwareAgl ~= nil then SEA_LEVEL_AWARE_AGL = msg.seaLevelAwareAgl end
   if msg.cruiseAltAgl   then CRUISE_ALT_AGL        = msg.cruiseAltAgl   end
   if msg.minAltAgl      then MIN_ALT_AGL           = msg.minAltAgl      end
   if msg.followAltAgl   then FOLLOW_ALT_AGL        = msg.followAltAgl   end

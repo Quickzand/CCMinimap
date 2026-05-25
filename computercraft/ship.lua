@@ -146,7 +146,7 @@ commands["goto"] = function(args)
   print(string.format("goto %d %d", x, z))
 end
 
-commands["lookgoto"] = function(args)
+commands["look"] = function(args)
   local maxDistance = tonumber(args[#args])
   local nameParts = args
   if maxDistance then
@@ -155,10 +155,9 @@ commands["lookgoto"] = function(args)
   end
   local name = table.concat(nameParts, " ")
   if name == "" then name = nil end
-  send({cmd = "lookgoto", name = name, maxDistance = maxDistance})
-  print("lookgoto" .. (name and (" " .. name) or ""))
+  send({cmd = "look", name = name, maxDistance = maxDistance})
+  print("look" .. (name and (" " .. name) or ""))
 end
-commands["look"] = commands["lookgoto"]
 
 commands["burner"] = function(args)
   local n = tonumber(args[1])
@@ -286,7 +285,7 @@ commands["help"] = function()
   print("Ship CLI. All forms work; pick whichever is easier to type.")
   print("")
   print("  minimap goto X Z         autopilot to coordinate X,Z")
-  print("  minimap lookgoto [p] [d] goto block player is looking at")
+  print("  minimap look [p] [d]     goto block player is looking at")
   print("  minimap burner N         drive burner to level N (0-15)")
   print("  minimap stop             disengage everything")
   print("  minimap hold [alt]       toggle altitude hold (optional alt)")

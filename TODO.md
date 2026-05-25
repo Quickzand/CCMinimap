@@ -19,9 +19,17 @@ center forward along the heading vector by `velocity * lookahead_seconds`, or
 sample two windows (under-ship + ahead) and demand cruise altitude above the
 max. Easy follow-up once the basic altitude controller is tuned.
 
-## Ship computer TERM mirror/control
+## Waypoint creation from pins
+Add an in-game way to turn the current map pin into a saved waypoint by writing
+to the local waypoint file through the UI.
+
+## Ship computer TERM mirror/control - Done
 Allow the main ship computer to render/control through both the attached
 monitor and the native terminal. This needs separate display/button maps if
 the two surfaces have different sizes, plus logical input de-duping so one
 physical monitor reachable through multiple peripheral paths does not toggle
 buttons twice.
+
+Implemented as `minimap-term`: a local TERM client that shares the minimap UI
+path, sends commands to the ship controller through local events, and leaves
+the main `minimap` process as the only ship controller.

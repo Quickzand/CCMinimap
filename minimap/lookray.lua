@@ -66,7 +66,7 @@ function M.init(env)
       if env.playerName and env.playerName ~= "" then target = env.playerName
       elseif #players == 1 then target = players[1].name end
     end
-    if not target or target == "" then return nil, "usage: lookgoto <player> [maxDistance]" end
+    if not target or target == "" then return nil, "look: no player configured" end
     for _, p in ipairs(players) do
       if p.name == target and type(p.position) == "table" and type(p.rotation) == "table" then
         if type(p.position.x) == "number" and type(p.position.z) == "number"
@@ -83,7 +83,7 @@ function M.init(env)
         end
       end
     end
-    return nil, "lookgoto: missing player yaw/pitch for " .. tostring(target)
+    return nil, "look: missing player yaw/pitch for " .. tostring(target)
   end
 
   local function lookupPlayer(name)
@@ -99,9 +99,9 @@ function M.init(env)
   function resolver.resolve(name, maxDistance)
     local p, err = lookupPlayer(name)
     if not p then return nil, err end
-    local limit = tonumber(maxDistance) or tonumber(env.maxDistance) or 128
+    local limit = tonumber(maxDistance) or tonumber(env.maxDistance) or 5000
     local step = tonumber(env.step) or 2
-    limit = clamp(limit, 8, 512)
+    limit = clamp(limit, 8, 5000)
     step = clamp(step, 0.5, 8)
 
     local dx, dy, dz = mcLookVector(p.yaw, p.pitch)
@@ -123,7 +123,7 @@ function M.init(env)
       end
       d = d + step
     end
-    return nil, "lookgoto: no terrain hit within " .. math.floor(limit) .. "m"
+    return nil, "look: no terrain hit within " .. math.floor(limit) .. "m"
   end
 
   return resolver
