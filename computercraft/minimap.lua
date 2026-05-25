@@ -125,6 +125,10 @@ if not fs.exists(CONFIG_FILE) then
   "chatControlEnabled": false,
   "termMirrorEnabled": true,
   "playerName": "",
+  "playerDetectorPeripheral": "",
+  "lookRayMaxDistance": 128,
+  "lookRayStep": 2,
+  "lookRaySeaLevel": 64,
   "airshipName": "main",
   "labelMode": "always",
   "callsignLen": 4,
@@ -175,6 +179,10 @@ if CALLSIGN_LEN > 16 then CALLSIGN_LEN = 16 end
 local AIRSHIP_NAME       = tostring(cfg.airshipName or "main")
 local CONTROL_SECRET     = tostring(cfg.controlSecret or "")
 local CONTROL_SECRET_HASH = tostring(cfg.controlSecretHash or "")
+local PLAYER_DETECTOR_PERIPHERAL = tostring(cfg.playerDetectorPeripheral or "")
+local LOOK_RAY_MAX_DISTANCE = tonumber(cfg.lookRayMaxDistance) or 128
+local LOOK_RAY_STEP = tonumber(cfg.lookRayStep) or 2
+local LOOK_RAY_SEA_LEVEL = tonumber(cfg.lookRaySeaLevel) or 64
 local Sha = dofile("minimap/sha256.lua")
 
 -- Ship migration: if a legacy plaintext controlSecret still exists on disk,
@@ -558,6 +566,116 @@ local function httpGetJson(url)
   local parsedOk, parsed = pcall(textutils.unserializeJSON, body)
   if not parsedOk then return nil, parsed end
   return parsed, nil
+end
+
+local playerDetector
+local function getPlayerDetector()
+  if playerDetector then return playerDetector end
+  if PLAYER_DETECTOR_PERIPHERAL ~= "" then
+    local p = peripheral.wrap(PLAYER_DETECTOR_PERIPHERAL)
+    if p and type(p.getPlayer) == "function" then
+      playerDetector = p
+      return playerDetector
+    end
+  end
+  local p = peripheral.find("player_detector")
+  if p and type(p.getPlayer) == "function" then playerDetector = p end
+  return playerDetector
+end
+
+local function playerFromDetector(name)
+  if not name or name == "" then return nil end
+  local detector = getPlayerDetector()
+  if not detector then return nil end
+  local ok, data = pcall(detector.getPlayer, name)
+  if not ok or type(data) ~= "table" then return nil end
+  if type(data.x) ~= "number" or type(data.z) ~= "number" then return nil end
+  if type(data.yaw) ~= "number" or type(data.pitch) ~= "number" then return nil end
+  return {
+    source = "player_detector",
+    name = name,
+    x = data.x,
+    y = data.y or 0,
+    z = data.z,
+    yaw = data.yaw,
+    pitch = data.pitch,
+  }
+end
+
+local function playerFromBlueMap(name)
+  local feed = httpGetJson(SERVER .. "/players")
+  local players = feed and feed.players
+  if type(players) == "table" then state.players = players else players = state.players or {} end
+  local target = name
+  if not target or target == "" then
+    if PLAYER_NAME ~= "" then target = PLAYER_NAME
+    elseif #players == 1 then target = players[1].name end
+  end
+  if not target or target == "" then return nil, "usage: lookgoto <player> [maxDistance]" end
+  for _, p in ipairs(players) do
+    if p.name == target and type(p.position) == "table" and type(p.rotation) == "table" then
+      if type(p.position.x) == "number" and type(p.position.z) == "number"
+         and type(p.rotation.yaw) == "number" and type(p.rotation.pitch) == "number" then
+        return {
+          source = "bluemap",
+          name = p.name,
+          x = p.position.x,
+          y = p.position.y or 0,
+          z = p.position.z,
+          yaw = p.rotation.yaw,
+          pitch = p.rotation.pitch,
+        }
+      end
+    end
+  end
+  return nil, "lookgoto: missing player yaw/pitch for " .. tostring(target)
+end
+
+local function lookupLookPlayer(name)
+  local target = (name and name ~= "") and name or PLAYER_NAME
+  if target and target ~= "" then return playerFromDetector(target) or playerFromBlueMap(target) end
+  local p, err = playerFromBlueMap(nil)
+  if p and p.name then return playerFromDetector(p.name) or p end
+  return nil, err
+end
+
+local function lookGroundY(x, z)
+  local h = httpGetJson(string.format("%s/height?x=%s&z=%s&rb=0",
+    SERVER, urlencode(x), urlencode(z)))
+  if h and type(h.groundMaxY) == "number" then return h.groundMaxY end
+  return LOOK_RAY_SEA_LEVEL
+end
+
+local function resolveLookTarget(name, maxDistance)
+  local p, err = lookupLookPlayer(name)
+  if not p then return nil, err end
+  local limit = tonumber(maxDistance) or LOOK_RAY_MAX_DISTANCE
+  limit = clamp(limit, 8, 512)
+  local step = clamp(LOOK_RAY_STEP, 0.5, 8)
+  local yaw = math.rad(p.yaw)
+  local pitch = math.rad(p.pitch)
+  local horizontal = math.cos(pitch)
+  local dx = -math.sin(yaw) * horizontal
+  local dy = -math.sin(pitch)
+  local dz = math.cos(yaw) * horizontal
+  local eyeY = (p.y or 0) + 1.62
+  local d = step
+  while d <= limit do
+    local x = p.x + dx * d
+    local y = eyeY + dy * d
+    local z = p.z + dz * d
+    if y <= lookGroundY(x, z) + 1 then
+      return {
+        x = math.floor(x),
+        z = math.floor(z),
+        player = p.name,
+        source = p.source,
+        distance = d,
+      }
+    end
+    d = d + step
+  end
+  return nil, "lookgoto: no terrain hit within " .. math.floor(limit) .. "m"
 end
 
 -- Find nav peripheral by type then by method scan; mirrors how peripheral.find("speaker") works.
@@ -1109,22 +1227,27 @@ overlayWaypoints = function(cx, cz, mapH, restampOnly)
   end
 end
 
--- Pin: yellow hollow ring + "PIN" / target-name label. Lives inside the
+-- Pin/CLI target: yellow hollow ring + label. Lives inside the
 -- marker do-block so it can call overlayMarkerDisc directly without
 -- exposing it at chunk level.
 overlayPin = function(cx, cz, mapH)
-  if not state.target or state.target.kind ~= "pin" then return end
+  if not state.target or (state.target.kind ~= "pin" and state.target.kind ~= "cli") then return end
   local col, row = worldToCell(state.target.x, state.target.z, cx, cz, mapH)
   if row < 1 or row > mapH then return end
   -- Clamp so the ring's right cell stays on-screen.
   local mc = math.max(1, math.min(width - 1, col))
   overlayMarkerDisc(mc, row, "1", mapH)   -- "1" = yellow in the server palette
   if LABEL_MODE == "off" then return end
-  -- Default the label to "PIN" -- targets created via the PIN button use
-  -- name="Pin", which the user wants surfaced as the static word PIN. CLI /
-  -- waypoint-created pins with custom names still show their name.
+  -- CLI goto/lookgoto targets show their resolved coordinate; interactive
+  -- pins keep the existing PIN/custom-name behavior.
   local rawName = state.target.name or "Pin"
-  local name = ((rawName == "Pin") and "PIN" or rawName):sub(1, 8)
+  local name
+  if state.target.kind == "cli" then
+    name = string.format("X%d Z%d", math.floor(state.target.x or 0), math.floor(state.target.z or 0))
+  else
+    name = ((rawName == "Pin") and "PIN" or rawName)
+  end
+  name = name:sub(1, 14)
   local lx = mc + 3  -- 2-cell ring + 1-col gap
   if lx + #name - 1 > width then lx = math.max(1, mc - #name - 1) end
   if lx >= 1 and lx <= width then
@@ -2541,6 +2664,28 @@ local function applyCommand(cmd)
     state.autoStatus = ""
     resetLiftIntegrator()
     saveControlState()
+
+  elseif id == "lookgoto" then
+    local target, err = resolveLookTarget(cmd.name, cmd.maxDistance)
+    if target then
+      state.target = {
+        kind = "cli",
+        name = "LOOK " .. tostring(target.player or "?"),
+        x = target.x,
+        z = target.z,
+        color = "e",
+      }
+      state.engaged = true
+      state.phase = nil
+      state.burnerTarget = nil
+      state.autoStatus = string.upper(tostring(target.source or "LOOK"))
+      state.lastError = nil
+      resetLiftIntegrator()
+      os.queueEvent("map_dirty")
+      saveControlState()
+    else
+      state.lastError = err or "lookgoto failed"
+    end
 
   elseif id == "goto_wp" and type(cmd.name) == "string" then
     local target = cmd.name:lower()

@@ -98,7 +98,7 @@ current = current or {}
 
 -- 4. Shell autocomplete for `minimap <subcommand> [args]`. Registered before
 -- minimap launches so the prompt has completions available immediately.
-local SUBCOMMANDS = {"goto", "burner", "stop", "hold", "agl", "status", "wp", "ctl", "password", "help", "--help"}
+local SUBCOMMANDS = {"goto", "lookgoto", "look", "burner", "stop", "hold", "agl", "status", "wp", "ctl", "password", "help", "--help"}
 
 local function suffixesFromPrefix(list, prefix)
   local out = {}

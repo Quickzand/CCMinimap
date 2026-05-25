@@ -199,8 +199,13 @@ def create_app() -> Flask:
                 return v
             x = number("x", 0.0, -30_000_000, 30_000_000)
             z = number("z", 0.0, -30_000_000, 30_000_000)
-            r = int(number("r", 1, 0, 8))
-            result = client.sample_ground_height(x, z, chunk_radius=r)
+            rb_arg = request.args.get("rb")
+            if rb_arg is not None:
+                rb = int(number("rb", 0, 0, 256))
+                result = client.sample_ground_height(x, z, radius_blocks=rb)
+            else:
+                r = int(number("r", 1, 0, 8))
+                result = client.sample_ground_height(x, z, chunk_radius=r)
             result["x"] = x
             result["z"] = z
             return jsonify(result)
