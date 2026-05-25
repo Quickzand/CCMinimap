@@ -1978,28 +1978,17 @@ local function drawWaypointsScreen(mapH)
 
   state.targetCells = {}
   local actionRows = {
-    { label = "+ SHIP POS",   cmd = "wp_add_ship",   enabled = state.lastPos ~= nil },
-    { label = "+ PLAYER POS", cmd = "wp_add_player", enabled = (#(state.players or {}) > 0) },
-    { label = "+ TARGET POS", cmd = "wp_add_target", enabled = state.target ~= nil },
+    { label = "[ ADD SHIP POS ]",   cmd = "wp_add_ship",   enabled = state.lastPos ~= nil },
+    { label = "[ ADD PLAYER POS ]", cmd = "wp_add_player", enabled = (#(state.players or {}) > 0) },
+    { label = "[ ADD TARGET POS ]", cmd = "wp_add_target", enabled = state.target ~= nil },
   }
-  local listStartRow = 2
-  for _, action in ipairs(actionRows) do
-    if listStartRow > mapH then break end
-    monitor.setCursorPos(1, listStartRow)
-    monitor.setBackgroundColor(colors.black); monitor.clearLine()
-    monitor.setTextColor(action.enabled and colors.lime or colors.gray)
-    monitor.write(action.label:sub(1, width))
-    table.insert(state.targetCells, {
-      col1 = 1, col2 = width, row = listStartRow, cmd = action.cmd,
-    })
-    listStartRow = listStartRow + 1
-  end
+  local buttonStartRow = math.max(2, mapH - #actionRows + 1)
 
-  local visRows = mapH - listStartRow + 1
+  local visRows = buttonStartRow - 2
   for i = 1, visRows do
     local idx  = i + state.wpScroll
     local item = items[idx]
-    local row  = i + listStartRow - 1
+    local row  = i + 1
     if row > mapH then break end
     monitor.setCursorPos(1, row)
     monitor.setBackgroundColor(colors.black); monitor.clearLine()
@@ -2035,6 +2024,19 @@ local function drawWaypointsScreen(mapH)
         color = isPlayer and "b" or paletteHexFor(item.color),
       })
     end
+  end
+
+  local row = buttonStartRow
+  for _, action in ipairs(actionRows) do
+    if row > mapH then break end
+    monitor.setCursorPos(1, row)
+    monitor.setBackgroundColor(colors.black); monitor.clearLine()
+    monitor.setTextColor(action.enabled and colors.white or colors.gray)
+    monitor.write(action.label:sub(1, width))
+    table.insert(state.targetCells, {
+      col1 = 1, col2 = math.min(width, #action.label), row = row, cmd = action.cmd,
+    })
+    row = row + 1
   end
 end
 
