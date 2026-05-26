@@ -1,8 +1,6 @@
-
 # BlueMap Minimap
 
-Minecraft minimap and autopilot for Create Aeronautics airships, using BlueMap
-and CC:Tweaked.
+Minimap and autopilot program for Create Aeronautics airships using BlueMap and CC:Tweaked.
 
 ## Screenshots
 
