@@ -1,6 +1,7 @@
--- Self-updating boot: pulls latest startup.lua and minimap.lua from the server,
--- merges any new default config keys without overwriting existing ones, then
--- launches minimap. Network failures are non-fatal -- whatever is on disk runs.
+-- Self-updating boot: pulls latest startup.lua, CLI shim, and minimap UI from
+-- the server, merges any new default config keys without overwriting existing
+-- ones, then launches the UI. Network failures are non-fatal -- whatever is on
+-- disk runs.
 -- __SERVER_URL__ is substituted by the server (app.py) from CLIENT_SERVER_URL.
 local SERVER = "__SERVER_URL__"
 local CONFIG = "minimap.cfg"
@@ -54,8 +55,10 @@ if syncFile("startup.lua") then
   os.reboot()
 end
 
--- 2. Update minimap.lua in place (not yet loaded, so no reboot needed).
+-- 2. Update the CLI shim and the long-running UI in place (not yet loaded, so
+-- no reboot needed).
 syncFile("minimap.lua")
+syncFile("minimap-ui.lua")
 syncFile("minimap-term.lua")
 syncFile("minimap/cache.lua")
 syncFile("minimap/lift.lua")
@@ -64,12 +67,12 @@ syncFile("minimap/lookray.lua")
 syncFile("minimap/cfgutil.lua")
 syncFile("minimap/sha256.lua")
 
--- 2a. CLI dispatcher. Invoke commands as `minimap <cmd>`; minimap.lua
--- forwards to ship.lua when called with args.
+-- 2a. CLI dispatcher. Invoke commands as `minimap <cmd>`; minimap.lua is a
+-- thin shim to ship.lua.
 syncFile("ship.lua")
 syncFile("chatctl.lua")
 
--- 2b. Shared Lua modules are synced under minimap/ before minimap.lua
+-- 2b. Shared Lua modules are synced under minimap/ before minimap-ui.lua
 -- launches so its `dofile(...)` calls succeed.
 local Cfg = dofile("minimap/cfgutil.lua")
 
@@ -136,7 +139,7 @@ if minimapPath then
   shell.setCompletionFunction(minimapPath, minimapCompleter)
 end
 
-shell.run("bg", "minimap")
+shell.run("bg", "minimap-ui")
 if current.termMirrorEnabled ~= false then
   shell.run("bg", "minimap-term")
 end

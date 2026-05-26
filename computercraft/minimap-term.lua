@@ -4,7 +4,5 @@ if multishell and multishell.setTitle and multishell.getCurrent then
   multishell.setTitle(multishell.getCurrent(), "minimap-term")
 end
 
-_G.MINIMAP_TERM_CLIENT = true
-local ok, err = pcall(dofile, "minimap.lua")
-_G.MINIMAP_TERM_CLIENT = nil
+local ok, err = pcall(shell.run, "minimap-ui", "--term-client")
 if not ok then error(err, 0) end

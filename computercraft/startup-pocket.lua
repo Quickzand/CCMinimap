@@ -55,7 +55,7 @@ if syncFile("startup-pocket.lua", "startup.lua") then
   os.reboot()
 end
 
--- 2. Pull the pocket client (same minimap.lua content under a different name).
+-- 2. Pull the pocket client (same minimap-ui.lua content under a different name).
 syncFile("minimap-pocket.lua", "minimap-pocket.lua")
 syncFile("minimap/cache.lua", "minimap/cache.lua")
 syncFile("minimap/cfgutil.lua", "minimap/cfgutil.lua")
@@ -66,16 +66,15 @@ syncFile("minimap/sha256.lua", "minimap/sha256.lua")
 -- shim below forwards to ship.lua.
 syncFile("ship.lua", "ship.lua")
 
--- The long-running program here is minimap-pocket.lua, so `minimap` alone
--- isn't a thing on the pocket. Drop a thin shim so `minimap <cmd>` and
--- `minimap --help` work the same as on the ship.
-local minimapShim = 'shell.run("ship", ...)\n'
+-- The long-running program here is minimap-pocket.lua. Keep `minimap` as the
+-- CLI shim so `minimap <cmd>` and `minimap --help` work the same as on the ship.
+local minimapShim = 'return shell.run("ship", ...)\n'
 if readFile("minimap.lua") ~= minimapShim then
   writeFile("minimap.lua", minimapShim)
 end
 
 -- sha256.lua isn't strictly needed for v1 pocket auth (pocket sends
--- plaintext) but minimap.lua dofile()s it unconditionally and it's tiny.
+-- plaintext) but the pocket UI dofile()s it unconditionally and it's tiny.
 -- Future v2 challenge-response will need it on the pocket anyway.
 local Cfg = dofile("minimap/cfgutil.lua")
 

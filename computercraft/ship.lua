@@ -11,7 +11,7 @@
 --
 -- Adding a new command:
 --   1. Add a function under `commands` (keyed by the shell name).
---   2. Add a matching `elseif id == "..."` branch in minimap.lua applyCommand.
+--   2. Add a matching `elseif id == "..."` branch in minimap-ui.lua applyCommand.
 --   3. Optionally add the name to SHIM_NAMES in startup.lua so a bare
 --      `mycmd ...` invocation works without `ship` prefix.
 

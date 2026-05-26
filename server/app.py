@@ -240,7 +240,7 @@ def create_app() -> Flask:
     @app.get("/config.defaults")
     def config_defaults():
         try:
-            with open("/app/computercraft/minimap.lua") as f:
+            with open("/app/computercraft/minimap-ui.lua") as f:
                 lua = f.read()
         except OSError as error:
             return jsonify({"error": str(error)}), 500
@@ -271,7 +271,7 @@ def create_app() -> Flask:
     @app.get("/config.defaults.pocket")
     def config_defaults_pocket():
         try:
-            with open("/app/computercraft/minimap.lua") as f:
+            with open("/app/computercraft/minimap-ui.lua") as f:
                 lua = f.read()
         except OSError as error:
             return jsonify({"error": str(error)}), 500
@@ -288,6 +288,10 @@ def create_app() -> Flask:
     def minimap_lua():
         return serve_lua("/app/computercraft/minimap.lua")
 
+    @app.get("/minimap-ui.lua")
+    def minimap_ui_lua():
+        return serve_lua("/app/computercraft/minimap-ui.lua")
+
     @app.get("/minimap/<path:name>.lua")
     def minimap_module_lua(name):
         if "/" in name or name.startswith("."):
@@ -296,10 +300,10 @@ def create_app() -> Flask:
 
     @app.get("/minimap-pocket.lua")
     def minimap_pocket_lua():
-        # Same file content as /minimap.lua; minimap.lua branches on pocket~=nil.
+        # Same file content as /minimap-ui.lua; the UI branches on pocket~=nil.
         # Served under a second URL so the pocket can keep a distinct local
         # filename and config file.
-        return serve_lua("/app/computercraft/minimap.lua")
+        return serve_lua("/app/computercraft/minimap-ui.lua")
 
     @app.get("/minimap-term.lua")
     def minimap_term_lua():
