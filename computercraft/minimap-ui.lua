@@ -535,6 +535,7 @@ end
 
 local monitor = findMonitor()
 if monitor.setTextScale then monitor.setTextScale(0.5) end
+local monitorName = (not IS_CLIENT and peripheral.getName) and peripheral.getName(monitor) or nil
 local width, height = monitor.getSize()
 
 -- The pocket has a tight 26x20 screen, so its OSD uses two rows: buttons on
@@ -3207,8 +3208,12 @@ end
 local function eventLoop()
   while state.running do
     local event = { os.pullEvent() }
-    if event[1] == "monitor_touch" or event[1] == "mouse_click" then
-      handleTouch((table.unpack or unpack)(event))
+    if event[1] == "monitor_touch" then
+      if not IS_CLIENT and (not monitorName or event[2] == monitorName) then
+        handleTouch((table.unpack or unpack)(event))
+      end
+    elseif event[1] == "mouse_click" then
+      if IS_CLIENT then handleTouch((table.unpack or unpack)(event)) end
     elseif event[1] == "mouse_drag" then
       -- Pocket terminal drag: event = { "mouse_drag", button, x, y }
       if state.screen == "map" and state.lastPos and state.hasMap then
