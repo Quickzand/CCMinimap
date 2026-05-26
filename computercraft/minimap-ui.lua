@@ -2990,10 +2990,7 @@ end
 
 -- commitPendingTap is stored on the state table so it can be called from
 -- both handleTouch and eventLoop without needing a top-level local slot.
-state._placePinAt = function(x, y, disarm)
-  if state.screen ~= "map" or not state.lastPos or not state.hasMap or y > mapHeight() then return false end
-  local cx, cz = mapCenter()
-  local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
+state._placePinWorld = function(wx, wz, disarm)
   dispatchCommand({
     cmd = "set_target",
     target = {
@@ -3006,6 +3003,13 @@ state._placePinAt = function(x, y, disarm)
   })
   if disarm then state.pinArmed = false end
   return true
+end
+
+state._placePinAt = function(x, y, disarm)
+  if state.screen ~= "map" or not state.lastPos or not state.hasMap or y > mapHeight() then return false end
+  local cx, cz = mapCenter()
+  local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
+  return state._placePinWorld(wx, wz, disarm)
 end
 
 state._commitTap = function()
@@ -3027,7 +3031,9 @@ end
 state._startPinHold = function(x, y, requireRepeat)
   state._cancelPinHold()
   if state.pinHoldEnabled and state.screen == "map" and state.lastPos and state.hasMap and y <= mapHeight() then
-    state.pinHold = { x = x, y = y, timer = os.startTimer(0.7), requireRepeat = requireRepeat == true }
+    local cx, cz = mapCenter()
+    local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
+    state.pinHold = { x = x, y = y, wx = wx, wz = wz, timer = os.startTimer(0.7) }
   end
 end
 
@@ -3235,9 +3241,7 @@ local function eventLoop()
       elseif state.pinHold and event[2] == state.pinHold.timer then
         local hold = state.pinHold
         state.pinHold = nil
-        if not hold.requireRepeat or hold.seenAgain then
-          state._placePinAt(hold.x, hold.y, false)
-        end
+        state._placePinWorld(hold.wx, hold.wz, false)
       end
     elseif event[1] == "term_resize" then
       width, height = monitor.getSize()
