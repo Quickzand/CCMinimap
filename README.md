@@ -1,132 +1,264 @@
-# BlueMap Minimap
+# CCMinimap
 
-Minimap and autopilot program for Create Aeronautics airships using BlueMap and CC:Tweaked.
+Minimap and autopilot software for Create Aeronautics airships using data from
+BlueMap and in-game peripherals.
+
+## Requirements
+
+Server:
+
+- [CC:Tweaked](https://tweaked.cc/)
+- [Create Aeronautics](https://github.com/Sciecode/create-aeronautics)
+- [BlueMap](https://bluemap.bluecolored.de/) running on your world. This provides the terrain and player data.
+
+Host:
+*The machine running CCMinimap's server-side components*
+
+- Docker / Docker Compose
+- Network access from the host to your BlueMap web server
+- Network access from ComputerCraft to CCMinimap's server URL
+
+In-game:
+
+- [GPS constellation](https://tweaked.cc/guide/gps_setup.html)
+- Advanced computer
+- Ender modem
+- `navigation_table` with a compass (for yaw)
+- Redstone Links and Redstone Relays (for autopilot)
+- Advanced monitors (optional)
+- `altitude_sensor` (optional)
+- `velocity_sensor` (optional)
+- Ender Pocket Computer (optional)
 
 ## Screenshots
 
-<img width="1920" height="1081" alt="2026-05-12_20 14 04" src="https://github.com/user-attachments/assets/510590df-f567-4ef9-8bbd-5784d08e58b2" />
-<img width="1920" height="1081" alt="2026-05-12_20 14 23" src="https://github.com/user-attachments/assets/e6a0f4c1-0c56-4d83-beb9-06f049f47385" />
+![CCMinimap on a large monitor](docs/screenshots/monitor-map.png)
+
+![Placing a map pin](docs/screenshots/map-pin.png)
+
+![Waypoint screen](docs/screenshots/waypoints-screen.png)
+
+![Controls screen](docs/screenshots/controls-screen.png)
+
+![Settings screen](docs/screenshots/settings-screen.png)
+
+![Pocket remote](docs/screenshots/pocket-remote.png)
+
+![Terminal mirror](docs/screenshots/terminal-mirror.png)
+
+## Setup
+
+### Host
+
+Set up your `.env` file:
+
+```sh
+cp .env.example .env
+```
+
+Set the BlueMap URL, map id, and the URL your CC computers will use:
+
+```sh
+BLUEMAP_BASE_URL=http://your-bluemap-host:8100
+BLUEMAP_MAP_ID=world
+CLIENT_SERVER_URL=http://your-public-host:5055
+```
+
+Optionally, create the waypoint file:
+
+```sh
+cp waypoints.example.json waypoints.json
+```
+
+Start the server:
+
+```sh
+docker compose up -d --build
+```
+
+Health check:
+
+```sh
+curl http://your-public-host:5055/health
+```
+
+### In-game install
+
+Install the startup script on an Advanced Computer on your airship:
+
+```lua
+wget http://your-public-host:5055/startup.lua startup.lua
+reboot
+```
+
+The computer will now update itself and open CCMinimap on boot. Delete
+`startup.lua` if you want to stop that.
+
+You can also install on a pocket computer for remote control:
+
+```lua
+wget http://your-public-host:5055/startup-pocket.lua startup.lua
+reboot
+```
+
+For security and remote control binding, set the same password on the ship and
+pocket:
+
+```lua
+minimap password your-password-here
+```
+
+If you run more than one ship, give each ship a different `airshipName` in
+`minimap.cfg`.
+
+### In-game peripherals
+
+At this point, CCMinimap can run with just GPS, an advanced computer, an ender
+modem, BlueMap, and the CCMinimap server. It will be missing some core features
+until more peripherals are added.
+
+Peripherals can be placed next to the computer, or connected with modems and
+networking cables.
+
+Install a `navigation_table` on your ship and place a compass in it. This gives
+CCMinimap the ship's yaw. If the needle points the wrong way, set
+`headingOffset` in `minimap.cfg`; it is usually off by a multiple of 90 degrees.
+
+You can add an `altitude_sensor` and `velocity_sensor` as well. These give more
+accurate and more frequent Y-level and velocity updates, but GPS can provide
+both values if the sensors are not present.
+
+You can add a [Chat Box](https://docs.advanced-peripherals.de/0.8/peripherals/chat_box/)
+from Advanced Peripherals to control the ship with chat commands.
+
+### Autopilot
+
+Autopilot requires `redstone_relay` peripherals and Redstone Links. The minimum
+control set can fit on one relay using five links, or ten links counting the
+receiving side.
+
+Define those controls in `minimap.cfg` so CCMinimap knows which relay and side
+drives each ship control. Right-click the modem attached to a redstone relay to
+see its peripheral name.
+
+![Redstone relay with linked controls](docs/screenshots/redstone-relay-links.png)
+
+In this example, the redstone relay has links on four sides. Each link controls
+one direction: forward, back, turn left, or turn right. The computer sends a
+signal to the relay, which controls a clutch or gearshift hooked up to a
+propeller, similar to using a Linked Controller.
+
+![Linked propeller control](docs/screenshots/propeller-control-link.png)
+
+Burners can be controlled in two modes:
+
+- `direct`: one redstone link directly controls the burner.
+- `burner`: a redstone accumulator lets one signal add burner, one signal
+  subtract burner, and one signal read the output value.
+
+The accumulator takes more space, but still works with a Linked Controller if
+the computer crashes or you want manual control. Set the mode with `liftMode`
+in `minimap.cfg`. The default is `burner`.
+
+An example accumulator setup is shown below:
+
+![Burner accumulator setup](docs/screenshots/burner-accumulator.png)
+
+### Custom controls
+
+You can also add custom controls using any redstone toggle or pulse signal. For
+example, a rope elevator can be raised or lowered through a gearshift. Define
+these in `minimap.cfg` under `customControls`; the default config includes an
+example.
 
 ## Features
 
-- Map view, north-up, ship-centered. Zoom and LOD buttons.
-- OSD: position, heading, altitude, burner level, speed.
-- Altitude tape with ground line and burner-level marker.
-- Speedometer dial.
-- Tappable waypoints from `waypoints.json` and BlueMap markers.
-- Autopilot: climbs to a cruise AGL setpoint, PI-holds altitude, lands on arrival.
-- ALT button for altitude-only hold at current altitude.
-- Pocket remote mirrors ship state over rednet and forwards taps as commands.
+- Live BlueMap minimap displayed on advanced monitors, in TERM, and in pocket computers
+- UI with advanced controls such as pan and zoom and multiple tabs
+- Ship position, heading, altitude, speed, and burner readouts
+- Player, waypoint, pin, and peer-ship targets
+- Autopilot to coordinates, waypoints, players, and look targets
+- ALT hold and terrain-aware AGL hold
+- Pocket remote over rednet
+- Local terminal mirror on the ship computer
+- Optional chat commands from one configured player
 
-## Controls
+## Using It
 
-| Button | Action |
-|---|---|
-| `+` / `-` | Zoom in/out |
-| `L1`/`L2`/`L3` | Cycle BlueMap LOD |
-| `ALT LOCK` | Toggle altitude (Y) hold at current altitude |
-| `AGL LOCK` | Toggle altitude-above-ground hold at current AGL |
-| `1`/`5`/`10` | Controls-screen step. When ALT/AGL lock is on, `+`/`-` bump the locked target by this step; otherwise they bump burner |
-| `AUTO` | Engage autopilot (needs a target). Orthogonal to ALT/AGL lock — they drive altitude while AUTO drives horizontal |
-| `X` | Clear target |
+The monitor UI has four tabs:
 
-Tap a waypoint dot or another player to set them as the target.
+- `M`: map
+- `WP`: players, waypoints, and local waypoint actions
+- `C`: burner, holds, and custom controls
+- `S`: common tuning values
 
-## CLI
+Tap a player, waypoint, peer ship, or pin to select a target. `AUTO` flies to
+the selected target. `STOP` stops the autopilot. `X` clears the target.
 
-The same commands work from the ship CC, the pocket, or any computer with the
-shared `controlSecret`. Type `minimap` followed by a subcommand:
+ALT hold locks to a fixed Y level. AGL hold locks to a height above BlueMap's
+terrain sample. Autopilot handles horizontal movement, so ALT/AGL hold can be
+used with or without `AUTO`.
+
+The waypoint tab can save local waypoints from the ship position, a player
+position, or the current target. Shared waypoints still come from
+`waypoints.json` and BlueMap markers.
+
+Before trusting autopilot, make sure GPS, heading, burner level, and relay
+directions are all correct. If the ship turns the wrong way or cannot hold
+altitude manually, fix that first.
+
+## Commands
+
+The CLI works on the ship, on the pocket, and through the optional chat bridge.
 
 | Command | Action |
-|---|---|
-| `minimap goto X Z` | Autopilot to coordinate X,Z |
-| `minimap look [player] [distance]` | Autopilot to the block a player is looking at; defaults to configured `playerName` and 5000m |
-| `minimap wp <name>` | Autopilot to a named waypoint (tab-completes) |
-| `minimap burner N` | Drive burner to level N (0-15) |
-| `minimap hold [alt]` | Toggle altitude (Y) hold (optional explicit altitude) |
-| `minimap agl [offset]` | Toggle AGL hold (optional explicit offset above ground) |
-| `minimap stop` | Disengage autopilot, altitude/AGL hold, and manual burner |
-| `minimap status` | Print position / heading / mode |
-| `minimap --help` | Full list |
+| --- | --- |
+| `minimap goto X Z` | Fly to a coordinate |
+| `minimap look [player] [distance]` | Fly to the block a player is looking at |
+| `minimap wp <name>` | Fly to a named waypoint |
+| `minimap burner N` | Set burner level, 0-15 |
+| `minimap hold [altitude]` | Toggle fixed-altitude hold |
+| `minimap agl [offset]` | Toggle height-above-ground hold |
+| `minimap ctl <name> [on/off/toggle]` | Use a configured custom control |
+| `minimap stop` | Stop autopilot, holds, and manual burner override |
+| `minimap status` | Print position, heading, and mode |
+| `minimap password [password]` | Set or clear the control password |
+| `minimap help` | Show the command list |
 
-Tab completion is registered on boot for `minimap <sub>` and waypoint names.
+For chat control, enable `chatControlEnabled`, set `playerName`, and attach a
+`chat_box`. Commands start with `!minimap`:
 
-## Dependencies
-
-- [BlueMap](https://bluemap.bluecolored.de/)
-- [Create Aeronautics](https://github.com/Sciecode/create-aeronautics)
-- [CC:Tweaked](https://tweaked.cc/)
-- Docker
-
-## Server setup
-
-1. Copy `.env.example` to `.env` and fill in the values.
-2. `docker compose up -d --build`
-3. `curl http://your-host:5055/health` returns `{"ok": true}`.
-
-`waypoints.json` is volume-mounted into the container. Format in
-`waypoints.example.json`. Restart the container after editing.
-
-Rendered BlueMap tiles are cached for 1 hour by default. Tiles with transparent
-frontier pixels are cached for 30 seconds so newly explored chunks fill in
-quickly.
-
-## Ship CC computer
-
-Peripherals (any side, or via wired modems):
-
-- Advanced monitor
-- `altitude_sensor`, `velocity_sensor`, `navigation_table` with a compass
-- Two `redstone_relay`s on a wired modem network:
-  - Relay 0: forward/back/left/right WASD redstone links
-  - Relay 1: `liftUp`, `liftDown`, and a `liftLevel` analog input for the burner
-- A wireless or ender modem for the pocket remote
-
-Install:
-
-```
-> wget http://your-host:5055/startup.lua startup.lua
-> reboot
+```text
+!minimap wp Base
+!minimap stop
 ```
 
-Tune via `minimap.cfg`:
+## Configuration
 
-- `channels` / `inputs`: relay and side mapping
-- `hoverBurnerLevel`: starting burner level for the PI controller. Find by trial.
-- `liftKp`, `liftKi`, `liftKd`: altitude PI+D gains. Lower Kp and higher Kd if it
-  oscillates; Ki absorbs altitude-dependent burner equilibrium so AUTO doesn't
-  stall short of target over high terrain.
-- `cruiseAltitudeAboveGround`: target AGL when AUTO is engaged
-- `seaLevel`, `seaLevelAwareAgl`: floor AGL ground at sea level over water or
-  partially rendered map areas. Defaults to `63` and `true`.
-- `autoExclusiveDrive`: set to `true` to prevent AUTO from commanding forward
-  thrust while turning. Defaults to `false`.
-- `pinHoldEnabled`: set to `false` to disable dropping a map pin by holding
-  one spot for about 0.7 seconds. Defaults to `true`.
-- `termMirrorEnabled`: set to `false` to skip launching the local TERM mirror
-  alongside the monitor minimap. Defaults to `true`.
-- `airshipName`, `controlSecret`: pairing values (see below)
+Files you will probably edit:
 
-## Pocket
+- `.env`: server settings
+- `waypoints.json`: shared waypoints
+- `minimap.cfg`: ship settings, created on first boot
+- `minimap-pocket.cfg`: pocket settings, created on first boot
 
-Slot an ender modem into the back of an advanced pocket computer.
+Common ship settings:
 
-```
-> wget http://your-host:5055/startup-pocket.lua startup.lua
-> reboot
-```
+- `playerName`
+- `airshipName`
+- `hoverBurnerLevel`
+- `cruiseAltitudeAboveGround`
+- `minAltitudeAboveGround`
+- `followAltitudeAboveGround`
+- `seaLevelAwareAgl`
+- `termMirrorEnabled`
+- `chatControlEnabled`
+- `customControls`
 
-## Pairing
+Most ships need some tuning. For lift you can adjust `hoverBurnerLevel` as well as lift PID values.
 
-Both `minimap.cfg` and `minimap-pocket.cfg` have `airshipName` and
-`controlSecret`. The ship hosts on rednet as `airship-<airshipName>`; the
-pocket looks that up and signs each command with `controlSecret`. The defaults
-(`main` / `changeme`) are public, so change both on each device before flying.
+There are too many config options to list them all, but this was made to be as configurable as possible. If something is inverted or offset or needs tweaking, check the configs.
 
-## Multi-user
 
-For multiple players on one BlueMap proxy:
 
-- Blank `CLIENT_PLAYER_NAME` in `.env`
-- Each CC sets its own `playerName` in `minimap.cfg`
-- Each player picks their own `airshipName` and `controlSecret`
+MIT licensed. See `LICENSE`.
