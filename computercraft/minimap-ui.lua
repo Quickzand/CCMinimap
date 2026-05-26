@@ -2,6 +2,9 @@
 -- separate CLI shim that delegates to ship.lua.
 local _cliArgs = { ... }
 IS_TERM_CLIENT = (_G.MINIMAP_TERM_CLIENT == true) or (_cliArgs[1] == "--term-client")
+if IS_TERM_CLIENT and multishell and multishell.setTitle and multishell.getCurrent then
+  multishell.setTitle(multishell.getCurrent(), "minimap-term")
+end
 if #_cliArgs > 0 and not IS_TERM_CLIENT then
   return shell.run("ship", table.unpack(_cliArgs))
 end
