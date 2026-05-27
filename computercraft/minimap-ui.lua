@@ -2291,13 +2291,19 @@ local function drawOsd(x, y, z)
     end
     -- PIN lock: yellow bg when active blocks tap-to-pin so the current
     -- target can't be accidentally overwritten by a stray map tap.
-    local pinBg = state.pinArmed and colors.yellow or colors.lightGray
-    drawButton("pin_arm_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
+    if IS_CLIENT then
+      local autoBg = state.engaged and colors.lime or colors.lightGray
+      drawButton("auto", col, btnRow, "A", colors.black, autoBg); col = col + 2
+      drawButton("clear_target", col, btnRow, "X", colors.black, colors.lightGray); col = col + 1
+    else
+      local pinBg = state.pinArmed and colors.yellow or colors.lightGray
+      drawButton("pin_arm_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
+    end
     -- Full CTR button only on monitor (pocket already has the R slot above).
     if not IS_CLIENT and panned then
       drawButton("recenter", col, btnRow, " CTR ", colors.black, colors.cyan); col = col + 5
     end
-    if state.target then
+    if state.target and not IS_CLIENT then
       col = col + 1
       local autoLabel = state.engaged and " STOP " or " AUTO "
       local autoBg = state.engaged and colors.lime or colors.lightGray
