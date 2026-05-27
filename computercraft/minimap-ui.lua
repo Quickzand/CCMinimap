@@ -136,7 +136,6 @@ if not fs.exists(CONFIG_FILE) then
   "airshipName": "main",
   "labelMode": "always",
   "callsignLen": 4,
-  "zoomPreloadRadius": 0,
   "controlSecret": "",
   "controlSecretHash": "",
   "authVersion": 1
@@ -171,9 +170,6 @@ local LABEL_MODE = (type(cfg.labelMode) == "string" and isLabelMode(cfg.labelMod
 local CALLSIGN_LEN = tonumber(cfg.callsignLen) or 4
 if CALLSIGN_LEN < 1 then CALLSIGN_LEN = 1 end
 if CALLSIGN_LEN > 16 then CALLSIGN_LEN = 16 end
-local ZOOM_PRELOAD_RADIUS = math.floor(tonumber(cfg.zoomPreloadRadius) or 3)
-if ZOOM_PRELOAD_RADIUS < 0 then ZOOM_PRELOAD_RADIUS = 0 end
-if ZOOM_PRELOAD_RADIUS > 9 then ZOOM_PRELOAD_RADIUS = 9 end
 -- Pairing: AIRSHIP_NAME makes the rednet hostname unique per ship, so a
 -- pocket only discovers its own ship.
 --
@@ -734,16 +730,14 @@ end
 local info = httpGetJson(SERVER .. "/info")
 if info and info.palette then applyPalette(info.palette) end
 
-local function buildUrl(x, z, bpp, lod)
-  bpp = bpp or state.bpp
-  lod = lod or state.lod
+local function buildUrl(x, z)
   return SERVER .. "/frame?" .. table.concat({
     "x=" .. urlencode(math.floor(x * 10) / 10),
     "z=" .. urlencode(math.floor(z * 10) / 10),
     "w=" .. urlencode(width),
     "h=" .. urlencode(mapHeight()),
-    "bpp=" .. urlencode(bpp),
-    "lod=" .. urlencode(lod),
+    "bpp=" .. urlencode(state.bpp),
+    "lod=" .. urlencode(state.lod),
   }, "&")
 end
 
@@ -2443,14 +2437,10 @@ local MapCache = dofile("minimap/cache.lua").init({
   buildUrl = buildUrl,
   mapHeight = mapHeight,
   mapCenter = mapCenter,
-  pickLod = pickLod,
   tileKey = TileGrid.tileKey,
   tileWorldDim = TileGrid.tileWorldDim,
   tileIndexForWorld = TileGrid.tileIndexForWorld,
   width = function() return width end,
-  -- Disabled for now: CC http.get is blocking, so preload can delay the
-  -- interactive center fetch if the user zooms while a preload is in flight.
-  zoomPreloadRadius = 0,
   drawError = drawError,
   fullRedraw = fullRedraw,
 })

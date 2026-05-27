@@ -2,10 +2,6 @@ local M = {}
 
 local INCOMPLETE_RETRY_S = {2, 5, 10, 15}
 local FRONTIER_RETRY_S = 30
-local MIN_BPP = 0.25
-local MAX_BPP = 128
-local PRELOAD_RETRY_S = 5
-local PRELOAD_CACHE_MAX = 24
 
 local function incompleteRetryDelay(attempt)
   local idx = math.min(#INCOMPLETE_RETRY_S, math.max(1, attempt or 1))
@@ -19,54 +15,6 @@ end
 
 function M.init(env)
   local state = env.state
-
-  local function clampedBpp(value)
-    return math.min(MAX_BPP, math.max(MIN_BPP, value))
-  end
-
-  local function frameCenterKey(fetchBpp, fetchLod, mapH, cx, cz)
-    return table.concat({
-      env.width(),
-      mapH,
-      fetchBpp,
-      fetchLod,
-      math.floor(cx * 10) / 10,
-      math.floor(cz * 10) / 10,
-    }, ":")
-  end
-
-  local function fetchFrameData(cx, cz, fetchBpp, fetchLod)
-    return env.httpGetJson(env.buildUrl(cx, cz, fetchBpp, fetchLod))
-  end
-
-  local function rememberPreloadedFrame(key, data)
-    if not data or not data.text then return end
-    state.preloadedZoomTiles = state.preloadedZoomTiles or {}
-    state.preloadedZoomOrder = state.preloadedZoomOrder or {}
-    if not state.preloadedZoomTiles[key] then
-      state.preloadedZoomOrder[#state.preloadedZoomOrder + 1] = key
-    end
-    state.preloadedZoomTiles[key] = data
-    while #state.preloadedZoomOrder > PRELOAD_CACHE_MAX do
-      local old = table.remove(state.preloadedZoomOrder, 1)
-      state.preloadedZoomTiles[old] = nil
-    end
-  end
-
-  local function takePreloadedFrame(key)
-    local cache = state.preloadedZoomTiles
-    if not cache then return nil end
-    local data = cache[key]
-    if not data then return nil end
-    cache[key] = nil
-    for i, old in ipairs(state.preloadedZoomOrder or {}) do
-      if old == key then
-        table.remove(state.preloadedZoomOrder, i)
-        break
-      end
-    end
-    return data
-  end
 
   local function maybeFetchSidecar()
     if os.clock() < state.sidecarAt then return end
@@ -99,11 +47,7 @@ function M.init(env)
     local tileWB, tileHB = env.tileWorldDim(mapH)
     local cx = (state.tileOriginX or 0) + ti * tileWB
     local cz = (state.tileOriginZ or 0) + tj * tileHB
-    local preloadKey = frameCenterKey(fetchBpp, fetchLod, mapH, cx, cz)
-    local data, err = takePreloadedFrame(preloadKey)
-    if not data then
-      data, err = fetchFrameData(cx, cz, fetchBpp, fetchLod)
-    end
+    local data, err = env.httpGetJson(env.buildUrl(cx, cz))
     if data and data.text
        and state.bpp == fetchBpp and state.lod == fetchLod
        and state.tileW == env.width() and state.tileH == mapH then
@@ -140,42 +84,6 @@ function M.init(env)
     if data and data.error then state.lastError = data.error
     elseif err then state.lastError = err end
     return false
-  end
-
-  local function maybePreloadZoomCenter(mapH, mcx, mcz)
-    local radius = math.floor(tonumber(env.zoomPreloadRadius) or 0)
-    if radius <= 0 or not state.hasMap then return end
-    if state.zoomLoadingCenter or state.isDragging then return end
-    if state.zoomSettledAt and os.clock() < state.zoomSettledAt then return end
-
-    local centerKey = frameCenterKey(state.bpp, state.lod, mapH, mcx, mcz)
-    if state.zoomPreloadCenterKey ~= centerKey then
-      state.zoomPreloadCenterKey = centerKey
-      state.zoomPreloadRetryAt = {}
-    else
-      state.zoomPreloadRetryAt = state.zoomPreloadRetryAt or {}
-    end
-    local now = os.clock()
-    for dist = 1, radius do
-      for _, dir in ipairs({-1, 1}) do
-        local fetchBpp = dir < 0 and clampedBpp(state.bpp / (2 ^ dist))
-                         or clampedBpp(state.bpp * (2 ^ dist))
-        if fetchBpp ~= state.bpp then
-          local fetchLod = env.pickLod(fetchBpp)
-          local key = frameCenterKey(fetchBpp, fetchLod, mapH, mcx, mcz)
-          local hasPreload = state.preloadedZoomTiles and state.preloadedZoomTiles[key]
-          if not hasPreload and (state.zoomPreloadRetryAt[key] or 0) <= now then
-            local data = fetchFrameData(mcx, mcz, fetchBpp, fetchLod)
-            if data and data.text then
-              rememberPreloadedFrame(key, data)
-            else
-              state.zoomPreloadRetryAt[key] = now + PRELOAD_RETRY_S
-            end
-            return
-          end
-        end
-      end
-    end
   end
 
   local function mapTick()
@@ -265,7 +173,6 @@ function M.init(env)
     if state.hasMap then
       state.status = "ok"
       env.fullRedraw()
-      maybePreloadZoomCenter(mapH, mcx, mcz)
     elseif state.zoomLoadingCenter and state.loadingFallback then
       env.fullRedraw()
     else
