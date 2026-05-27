@@ -58,6 +58,7 @@ end
 -- 2. Pull the pocket client (same minimap-ui.lua content under a different name).
 syncFile("minimap-pocket.lua", "minimap-pocket.lua")
 syncFile("minimap/cache.lua", "minimap/cache.lua")
+syncFile("minimap/tilegrid.lua", "minimap/tilegrid.lua")
 syncFile("minimap/cfgutil.lua", "minimap/cfgutil.lua")
 syncFile("minimap/lookray.lua", "minimap/lookray.lua")
 syncFile("minimap/sha256.lua", "minimap/sha256.lua")
