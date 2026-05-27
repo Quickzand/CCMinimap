@@ -2274,7 +2274,7 @@ local function drawOsd(x, y, z)
     drawButton(tab.id, col, btnRow, tab.label, colors.black, active and colors.white or colors.lightGray)
     col = col + #tab.label
   end
-  col = col + 1
+  if not IS_CLIENT then col = col + 1 end
 
   if state.screen == "map" then
     drawButton("zoom_out", col, btnRow, " - "); col = col + 3
@@ -2293,8 +2293,8 @@ local function drawOsd(x, y, z)
     -- target can't be accidentally overwritten by a stray map tap.
     if IS_CLIENT then
       local autoBg = state.engaged and colors.lime or colors.lightGray
-      drawButton("auto", col, btnRow, "A", colors.black, autoBg); col = col + 2
-      drawButton("clear_target", col, btnRow, "X", colors.black, colors.lightGray); col = col + 1
+      drawButton("auto", col, btnRow, " A", colors.black, autoBg); col = col + 2
+      drawButton("clear_target", col, btnRow, " X", colors.black, colors.lightGray); col = col + 2
     else
       local pinBg = state.pinArmed and colors.yellow or colors.lightGray
       drawButton("pin_arm_toggle", col, btnRow, " PIN ", colors.black, pinBg); col = col + 5
