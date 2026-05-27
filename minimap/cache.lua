@@ -231,6 +231,7 @@ function M.init(env)
       if centerLoaded then
         state.zoomLoadingCenter = false
         state.loadingFallback = nil
+        state.loadingOverlayAt = nil
         state.lastError = nil
       end
       if state.hasMap then env.fullRedraw() end

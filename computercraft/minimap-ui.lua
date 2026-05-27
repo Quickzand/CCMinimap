@@ -136,7 +136,7 @@ if not fs.exists(CONFIG_FILE) then
   "airshipName": "main",
   "labelMode": "always",
   "callsignLen": 4,
-  "zoomPreloadRadius": 3,
+  "zoomPreloadRadius": 0,
   "controlSecret": "",
   "controlSecretHash": "",
   "authVersion": 1
@@ -1226,6 +1226,7 @@ end
 local function drawLoadingOverlay(mapH)
   local grid = state.loadingFallback
   if not grid then return end
+  if state.loadingOverlayAt and os.clock() < state.loadingOverlayAt then return end
   blitLabelOverMap("Loading...", 1, 1, mapH, "e", grid)
 end
 
@@ -2387,6 +2388,7 @@ local function fullRedraw()
       TileGrid.drawCachedMap(mapH)
       state.zoomLoadingCenter = false
       state.loadingFallback = nil
+      state.loadingOverlayAt = nil
       state.lastTapeCells = {}
       local cx, cz = mapCenter()
       -- drawCachedMap wiped everything, so the previous needle's painted
@@ -2446,7 +2448,9 @@ local MapCache = dofile("minimap/cache.lua").init({
   tileWorldDim = TileGrid.tileWorldDim,
   tileIndexForWorld = TileGrid.tileIndexForWorld,
   width = function() return width end,
-  zoomPreloadRadius = ZOOM_PRELOAD_RADIUS,
+  -- Disabled for now: CC http.get is blocking, so preload can delay the
+  -- interactive center fetch if the user zooms while a preload is in flight.
+  zoomPreloadRadius = 0,
   drawError = drawError,
   fullRedraw = fullRedraw,
 })
@@ -2536,8 +2540,9 @@ end
 -- and (on the ship) the rednet command listener, so a pocket tap and a monitor
 -- tap funnel through the same logic.
 local function beginZoomLoad()
-  state.loadingFallback = TileGrid.snapshot()
+  state.loadingFallback = TileGrid.snapshot() or state.loadingFallback
   state.zoomLoadingCenter = state.loadingFallback ~= nil
+  state.loadingOverlayAt = os.clock() + 0.35
   state.tiles = {}
   state.hasMap = false
   state.zoomSettledAt = os.clock() + 1.0  -- defer neighbour fetches to coalesce rapid scroll
