@@ -499,6 +499,8 @@ local state = {
   -- viewport until neighbours load.
   tileOriginX = 0,
   tileOriginZ = 0,
+  zoomLoadingCenter = false,
+  loadingFallback = nil,
   lastPos = nil,
   lastError = nil,
   -- Pan model: when not panned (panAnchorX == nil), the view follows the ship
@@ -763,9 +765,10 @@ end
 -- (i*tileWB, j*tileHB). Fetch URL uses that center.
 local function tileKey(i, j) return i .. "," .. j end
 
-local function tileWorldDim(mapH)
-  local bX = state.bpp * SUB_W
-  local bY = state.bpp * SUB_H
+local function tileWorldDim(mapH, grid)
+  local bpp = (grid and grid.bpp) or state.bpp
+  local bX = bpp * SUB_W
+  local bY = bpp * SUB_H
   return width * bX, mapH * bY, bX, bY
 end
 
@@ -774,29 +777,44 @@ end
 -- the half-cell-offset cell grid (without this, boundary cells render as
 -- black columns/rows). The origin is reset to the viewport centre on every
 -- grid wipe (zoom/resize), so the user's current view sits inside tile (0,0).
-local function tileIndexForWorld(wx, wz, mapH)
-  local tileWB, tileHB, bX, bY = tileWorldDim(mapH)
-  local ox = state.tileOriginX or 0
-  local oz = state.tileOriginZ or 0
+local function tileIndexForWorld(wx, wz, mapH, grid)
+  local tileWB, tileHB, bX, bY = tileWorldDim(mapH, grid)
+  local ox = (grid and grid.tileOriginX) or state.tileOriginX or 0
+  local oz = (grid and grid.tileOriginZ) or state.tileOriginZ or 0
   return math.floor((wx - ox + (tileWB - bX) / 2) / tileWB),
          math.floor((wz - oz + (tileHB - bY) / 2) / tileHB)
+end
+
+local function snapshotTileGrid()
+  if not state.hasMap then return nil end
+  return {
+    tiles = state.tiles,
+    bpp = state.tileBpp or state.bpp,
+    lod = state.tileLod or state.lod,
+    tileW = state.tileW,
+    tileH = state.tileH,
+    tileOriginX = state.tileOriginX,
+    tileOriginZ = state.tileOriginZ,
+  }
 end
 
 -- Returns (packed_byte, fg_char, bg_char) for the cell at screen (col, row),
 -- or nil if the relevant tile isn't loaded yet. Used by overlays that need
 -- to read terrain underneath a stencil.
-local function getCell(col, row, mapH, mcx, mcz)
-  local bX = state.bpp * SUB_W
-  local bY = state.bpp * SUB_H
+local function getCell(col, row, mapH, mcx, mcz, grid)
+  local bpp = (grid and grid.bpp) or state.bpp
+  local tiles = (grid and grid.tiles) or state.tiles
+  local bX = bpp * SUB_W
+  local bY = bpp * SUB_H
   local tileWB = width * bX
   local tileHB = mapH * bY
   local wx = mcx + (col - width / 2) * bX
   local wz = mcz + (row - mapH / 2) * bY
-  local ox = state.tileOriginX or 0
-  local oz = state.tileOriginZ or 0
+  local ox = (grid and grid.tileOriginX) or state.tileOriginX or 0
+  local oz = (grid and grid.tileOriginZ) or state.tileOriginZ or 0
   local ti = math.floor((wx - ox + (tileWB - bX) / 2) / tileWB)
   local tj = math.floor((wz - oz + (tileHB - bY) / 2) / tileHB)
-  local tile = state.tiles[tileKey(ti, tj)]
+  local tile = tiles[tileKey(ti, tj)]
   if not tile then return nil end
   local tc = math.floor((wx - ox - ti * tileWB) / bX + width / 2 + 0.5)
   local tr = math.floor((wz - oz - tj * tileHB) / bY + mapH / 2 + 0.5)
@@ -812,17 +830,24 @@ local EMPTY_PACKED = string.char(0x40)
 local EMPTY_FG     = "f"
 local EMPTY_BG     = "f"
 
-local function drawCachedMap(mapH)
-  if not state.hasMap or not state.lastPos then return end
+local function drawCachedMap(mapH, grid)
+  if not state.lastPos then return end
+  if grid then
+    if not grid.tiles then return end
+  elseif not state.hasMap then
+    return
+  end
   local mcx, mcz = mapCenter()
-  local bX = state.bpp * SUB_W
-  local bY = state.bpp * SUB_H
+  local bpp = (grid and grid.bpp) or state.bpp
+  local tiles = (grid and grid.tiles) or state.tiles
+  local bX = bpp * SUB_W
+  local bY = bpp * SUB_H
   local tileWB = width * bX
   local tileHB = mapH * bY
   local halfDxX = (tileWB - bX) / 2
   local halfDxY = (tileHB - bY) / 2
-  local ox = state.tileOriginX or 0
-  local oz = state.tileOriginZ or 0
+  local ox = (grid and grid.tileOriginX) or state.tileOriginX or 0
+  local oz = (grid and grid.tileOriginZ) or state.tileOriginZ or 0
   for r = 1, mapH do
     local wz = mcz + (r - mapH / 2) * bY
     local tj = math.floor((wz - oz + halfDxY) / tileHB)
@@ -831,7 +856,7 @@ local function drawCachedMap(mapH)
     for c = 1, width do
       local wx = mcx + (c - width / 2) * bX
       local ti = math.floor((wx - ox + halfDxX) / tileWB)
-      local tile = state.tiles[tileKey(ti, tj)]
+      local tile = tiles[tileKey(ti, tj)]
       local row_text = tile and tile.text[tr]
       if row_text then
         local tc = math.floor((wx - ox - ti * tileWB) / bX + width / 2 + 0.5)
@@ -1272,7 +1297,7 @@ local BG_IS_LIGHT = {
 -- to black or white per cell based on the bg's luminance. Cells with no tile
 -- loaded yet (getCell -> nil) fall back to a black bg so the label is still
 -- legible during pan.
-blitLabelOverMap = function(text, col, row, mapH, preferredFg)
+blitLabelOverMap = function(text, col, row, mapH, preferredFg, grid)
   if row < 1 or row > mapH then return end
   local mcx, mcz = mapCenter()
   local startCol = math.max(1, col)
@@ -1281,7 +1306,7 @@ blitLabelOverMap = function(text, col, row, mapH, preferredFg)
   if writeLen <= 0 then return end
   local textChars, fgChars, bgChars = {}, {}, {}
   for i = 1, writeLen do
-    local _, _, bg = getCell(startCol + i - 1, row, mapH, mcx, mcz)
+    local _, _, bg = getCell(startCol + i - 1, row, mapH, mcx, mcz, grid)
     local bgChar = bg or "f"
     local fgChar
     if preferredFg and BG_IS_LIGHT[preferredFg] ~= nil
@@ -1297,6 +1322,12 @@ blitLabelOverMap = function(text, col, row, mapH, preferredFg)
   end
   monitor.setCursorPos(startCol, row)
   monitor.blit(table.concat(textChars), table.concat(fgChars), table.concat(bgChars))
+end
+
+local function drawLoadingOverlay(mapH)
+  local grid = state.loadingFallback
+  if not grid then return end
+  blitLabelOverMap("Loading...", 1, 1, mapH, "e", grid)
 end
 
 local function overlayMarkerLabels(cx, cz, mapH)
@@ -2416,7 +2447,7 @@ local function drawOsd(x, y, z)
     end
   end
 
-  if state.lastError then
+  if state.lastError and not state.zoomLoadingCenter then
     monitor.setCursorPos(1, 1)
     monitor.setTextColor(colors.red)
     monitor.setBackgroundColor(colors.black)
@@ -2455,6 +2486,8 @@ local function fullRedraw()
   if state.screen == "map" then
     if state.hasMap then
       drawCachedMap(mapH)
+      state.zoomLoadingCenter = false
+      state.loadingFallback = nil
       state.lastTapeCells = {}
       local cx, cz = mapCenter()
       -- drawCachedMap wiped everything, so the previous needle's painted
@@ -2474,6 +2507,9 @@ local function fullRedraw()
       overlaySelfTriangle(state.shipHeading, mapH, cx, cz)
       overlayAltitudeTape(mapH)
       if not IS_CLIENT then overlaySpeedDial(mapH) end
+    elseif state.zoomLoadingCenter and state.loadingFallback then
+      drawCachedMap(mapH, state.loadingFallback)
+      drawLoadingOverlay(mapH)
     else
       clearMapArea(mapH)
     end
@@ -2485,6 +2521,9 @@ local function fullRedraw()
     drawSettingsScreen(mapH)
   end
   drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y or 0), math.floor(state.lastPos.z))
+  if state.screen == "map" and state.zoomLoadingCenter and state.loadingFallback then
+    drawLoadingOverlay(mapH)
+  end
 end
 
 local MapCache = dofile("minimap/cache.lua").init({
@@ -2595,27 +2634,31 @@ end
 -- Mutates state in response to a UI command. Shared by the local touch handler
 -- and (on the ship) the rednet command listener, so a pocket tap and a monitor
 -- tap funnel through the same logic.
+local function beginZoomLoad()
+  state.loadingFallback = snapshotTileGrid()
+  state.zoomLoadingCenter = state.loadingFallback ~= nil
+  state.tiles = {}
+  state.hasMap = false
+  state.zoomSettledAt = os.clock() + 1.0  -- defer neighbour fetches to coalesce rapid scroll
+  os.queueEvent("map_dirty")
+  if state.zoomLoadingCenter then fullRedraw() end
+end
+
 local function applyCommand(cmd)
   if type(cmd) ~= "table" then return end
   local id = cmd.cmd
   if id == "zoom_in" then
     state.bpp = clamp(state.bpp / 2, 0.25, 128)
     state.lod = pickLod(state.bpp)
-    state.tiles = {}; state.hasMap = false  -- bpp change re-maps tile coords
-    state.zoomSettledAt = os.clock() + 1.0  -- defer neighbour fetches to coalesce rapid scroll
-    os.queueEvent("map_dirty")
+    beginZoomLoad()
   elseif id == "zoom_out" then
     state.bpp = clamp(state.bpp * 2, 0.25, 128)
     state.lod = pickLod(state.bpp)
-    state.tiles = {}; state.hasMap = false
-    state.zoomSettledAt = os.clock() + 1.0
-    os.queueEvent("map_dirty")
+    beginZoomLoad()
   elseif id == "lod" then
     state.lod = state.lod + 1
     if state.lod > 3 then state.lod = 1 end
-    state.tiles = {}; state.hasMap = false
-    state.zoomSettledAt = os.clock() + 1.0
-    os.queueEvent("map_dirty")
+    beginZoomLoad()
   elseif id == "auto" then
     if state.target then
       state.engaged = not state.engaged

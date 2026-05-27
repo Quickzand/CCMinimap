@@ -135,7 +135,12 @@ function M.init(env)
     end
 
     if tileNeedsAttention(ci, cj) then
-      fetchTile(ci, cj, fetchBpp, fetchLod, mapH)
+      local centerLoaded = fetchTile(ci, cj, fetchBpp, fetchLod, mapH)
+      if centerLoaded then
+        state.zoomLoadingCenter = false
+        state.loadingFallback = nil
+        state.lastError = nil
+      end
       if state.hasMap then env.fullRedraw() end
     end
 
@@ -166,6 +171,8 @@ function M.init(env)
     state.frontierMode = frontierRetry
     if state.hasMap then
       state.status = "ok"
+      env.fullRedraw()
+    elseif state.zoomLoadingCenter and state.loadingFallback then
       env.fullRedraw()
     else
       env.drawError(state.lastError or "Loading map...")
