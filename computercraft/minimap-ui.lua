@@ -512,6 +512,12 @@ local state = {
   mapOffsetZ = 0,
   panAnchorX = nil,
   panAnchorZ = nil,
+  -- Pocket only: when true the view follows the holder's own BlueMap position
+  -- instead of the ship; the recenter (R) button toggles between the two.
+  -- selfPlayer caches our entry from the /players feed so mapCenter() stays
+  -- cheap (it's hit once per rendered cell).
+  followPlayer = true,
+  selfPlayer = nil,
   dragPrevX = nil,  -- last touch/drag cell for delta computation
   dragPrevY = nil,
   dragPrevTime = 0,
@@ -749,14 +755,33 @@ local function decodeTextRow(packed)
   return table.concat(out)
 end
 
+-- Pocket: the holder's own marker/center comes from the BlueMap /players feed
+-- (the same feed that powers other-player markers). Locate our entry by
+-- PLAYER_NAME. Returns nil on the ship UI so the follow-player path is
+-- pocket-only.
+local function selfPlayerEntry()
+  if not IS_POCKET then return nil end
+  for _, p in ipairs(state.players or {}) do
+    if p.name == PLAYER_NAME and type(p.position) == "table"
+       and type(p.position.x) == "number" and type(p.position.z) == "number" then
+      return p
+    end
+  end
+  return nil
+end
+
 -- Pan-adjusted map centre. All tile fetches and overlay calls use this so
 -- panning shifts both tiles and overlays together.
 local function mapCenter()
-  if not state.lastPos then return 0, 0 end
+  -- Pocket may center on the holder (state.selfPlayer, refreshed each fastTick)
+  -- instead of the ship; falls back to the ship when our feed entry is missing.
+  local center = state.lastPos
+  if state.followPlayer and state.selfPlayer then center = state.selfPlayer.position end
+  if not center then return 0, 0 end
   -- When panned, the view base is the anchor world position captured when the
-  -- user first dragged. When not panned, the base is the live ship position.
-  local baseX = state.panAnchorX or state.lastPos.x
-  local baseZ = state.panAnchorZ or state.lastPos.z
+  -- user first dragged. When not panned, the base is the live followed position.
+  local baseX = state.panAnchorX or center.x
+  local baseZ = state.panAnchorZ or center.z
   return baseX + (state.mapOffsetX or 0), baseZ + (state.mapOffsetZ or 0)
 end
 
@@ -1062,18 +1087,45 @@ local function registerHitbox(bbox, kind, name, x, z, color)
   end
 end
 
+-- True when the holder's BlueMap position is within a few map cells of the
+-- ship, so the self marker can be suppressed rather than fight the ship needle
+-- when you're standing on/near the ship.
+local SELF_NEAR_SHIP_CELLS = 3
+local function selfNearShip(pos)
+  if not state.lastPos then return false end
+  local dCol = (pos.x - state.lastPos.x) / (state.bpp * SUB_W)
+  local dRow = (pos.z - state.lastPos.z) / (state.bpp * SUB_H)
+  return (dCol * dCol + dRow * dRow) <= (SELF_NEAR_SHIP_CELLS * SELF_NEAR_SHIP_CELLS)
+end
+
 -- restampOnly: skip targetCells mutation so the fastTick re-blit doesn't
 -- multiply click targets between fullRedraws.
 overlayOtherPlayers = function(cx, cz, mapH, restampOnly)
   for _, p in ipairs(state.players or {}) do
-    if p.name ~= PLAYER_NAME and p.position then
+    local isSelf = (p.name == PLAYER_NAME)
+    -- Our own dot: never on the ship UI; on the pocket only when away from the
+    -- ship. Everyone else always draws.
+    local draw = p.position and (not isSelf or (IS_POCKET and not selfNearShip(p.position)))
+    if draw then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
-      local color = colorForPlayer(p.uuid or p.name or "?")
       local heading
       if type(p.rotation) == "table" and type(p.rotation.yaw) == "number" then
         heading = compassFromMcYaw(p.rotation.yaw)
       end
-      local bbox = overlayMarkerNeedle(col, row, heading, color, mapH)
+      -- You: a red needle like the ship, but with an orange base nub so it's
+      -- distinct from the ship's gray base and the peers' black base. Peers
+      -- keep their per-player hash color.
+      local bbox, color
+      if isSelf then
+        color = "2"
+        -- track=true so eraseSelfTriangle restores terrain under it each frame;
+        -- like the ship needle it sits in place and rotates, so it must be
+        -- erased between frames or old arms smear.
+        bbox = drawNeedle(col, row, heading, PEER_NEEDLE_LEN_SUB, "2", paletteHexFor("orange"), mapH, true)
+      else
+        color = colorForPlayer(p.uuid or p.name or "?")
+        bbox = overlayMarkerNeedle(col, row, heading, color, mapH)
+      end
       if not restampOnly then
         registerHitbox(bbox, "player", p.name, p.position.x, p.position.z, color)
       end
@@ -2481,6 +2533,9 @@ local function mapLoop()
 end
 
 local function fastTick()
+  -- Refresh our own /players entry once per tick so mapCenter() (called per
+  -- cell) can read state.selfPlayer without rescanning. nil on the ship UI.
+  state.selfPlayer = selfPlayerEntry()
   if not IS_CLIENT then
     local h = readHeading()
     if h then state.shipHeading = h end
@@ -2763,6 +2818,12 @@ local function applyCommand(cmd)
     state.pinArmed = not state.pinArmed
 
   elseif id == "recenter" then
+    -- On the pocket, if the view is already locked to a target (not panned) the
+    -- R button has no pan to undo, so it swaps which target we follow
+    -- (you <-> ship). When panned it just snaps back to the current target.
+    if IS_POCKET and state.panAnchorX == nil then
+      state.followPlayer = not state.followPlayer
+    end
     state.mapOffsetX = 0
     state.mapOffsetZ = 0
     state.panAnchorX = nil
@@ -2921,11 +2982,15 @@ end
 local function applyDrag(dx, dy)
   local bX = state.bpp * SUB_W
   local bY = state.bpp * SUB_H
-  -- First drag freezes the view at the ship's current world position. From
-  -- here on the offset is relative to that anchor, not the live ship.
-  if not state.panAnchorX and state.lastPos then
-    state.panAnchorX = state.lastPos.x
-    state.panAnchorZ = state.lastPos.z
+  -- First drag freezes the view at the currently-followed world position (the
+  -- player on the pocket when following, otherwise the ship). From here on the
+  -- offset is relative to that anchor, not the live target.
+  if not state.panAnchorX then
+    local anchor = (state.followPlayer and state.selfPlayer and state.selfPlayer.position) or state.lastPos
+    if anchor then
+      state.panAnchorX = anchor.x
+      state.panAnchorZ = anchor.z
+    end
   end
   state.mapOffsetX = (state.mapOffsetX or 0) - dx * bX
   state.mapOffsetZ = (state.mapOffsetZ or 0) - dy * bY
