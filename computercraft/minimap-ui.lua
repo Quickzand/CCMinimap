@@ -522,6 +522,8 @@ local state = {
   dragPrevY = nil,
   dragPrevTime = 0,
   isDragging = false,
+  gestureMoved = false,  -- this map gesture has panned >=1 cell; suppress marker select on its taps
+  pendingClickSel = nil, -- pocket/term: marker tap awaiting mouse_up; a drag-pan cancels it
   pendingMapTap = nil,   -- {x,y} of first monitor_touch in map area, pending drag/tap disambiguation
   pendingTapTimer = nil, -- timer id for committing the pending tap
   pinHoldEnabled = (cfg.pinHoldEnabled ~= false),
@@ -2995,6 +2997,7 @@ local function applyDrag(dx, dy)
   state.mapOffsetX = (state.mapOffsetX or 0) - dx * bX
   state.mapOffsetZ = (state.mapOffsetZ or 0) - dy * bY
   state.isDragging = true
+  state.gestureMoved = true
   if state.hasMap then fullRedraw() end
   os.queueEvent("map_dirty")
 end
@@ -3058,7 +3061,7 @@ local function handleTouch(evtName, side, x, y)
     local now = os.clock()
     local px, py, pt = state.dragPrevX, state.dragPrevY, state.dragPrevTime or 0
     local newGesture = (px == nil or py == nil or (now - pt) >= 0.6)
-    if newGesture then px, py = nil, nil end
+    if newGesture then px, py = nil, nil; state.gestureMoved = false end
     state.dragPrevX, state.dragPrevY, state.dragPrevTime = x, y, now
     if isMonitorTouch and state.pinHold and state.pinHold.x == x and state.pinHold.y == y then
       state.pinHold.seenAgain = true
@@ -3109,6 +3112,17 @@ local function handleTouch(evtName, side, x, y)
     if y == t.row and x >= t.col1 and x <= t.col2 then
       if t.cmd then
         dispatchCommand({ cmd = t.cmd, name = t.name, idx = t.idx })
+      elseif state.screen == "map" and isMonitorTouch and state.gestureMoved then
+        -- Monitor: this touch is part of a pan gesture, not a deliberate tap, so
+        -- don't let it hijack the current target by selecting the marker under it.
+        state._cancelPinHold()
+        return
+      elseif state.screen == "map" and not isMonitorTouch then
+        -- Pocket/terminal: defer marker selection until mouse_up. If the click
+        -- turns into a drag-pan, mouse_drag clears this so the target is kept.
+        state.pendingClickSel = { kind = t.kind, name = t.name, x = t.x, z = t.z, color = t.color }
+        state._cancelPinHold()
+        return
       else
         dispatchCommand({
           cmd = "set_target",
@@ -3228,6 +3242,7 @@ local function eventLoop()
       -- Pocket terminal drag: event = { "mouse_drag", button, x, y }
       if state.screen == "map" and state.lastPos and state.hasMap then
         state._cancelPinHold()
+        state.pendingClickSel = nil  -- a drag cancels a pending marker tap-select
         local mx, my = event[3], event[4]
         if state.dragPrevX ~= nil then
           local dx = mx - state.dragPrevX
@@ -3238,6 +3253,11 @@ local function eventLoop()
       end
     elseif event[1] == "mouse_up" then
       -- End of drag: clear drag state so next click isn't treated as drag delta.
+      -- A pending marker tap-select that survived (no drag cancelled it) commits here.
+      if state.pendingClickSel then
+        dispatchCommand({ cmd = "set_target", target = state.pendingClickSel })
+        state.pendingClickSel = nil
+      end
       state.dragPrevX, state.dragPrevY = nil, nil
       state.isDragging = false
       state._cancelPinHold()
