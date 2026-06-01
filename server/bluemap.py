@@ -272,8 +272,11 @@ class BlueMapClient:
         """Sample surface Y from BlueMap LOD-1 lowres heightmap.
 
         BlueMap lowres tiles are 501x1002 PNGs: top half (y<tileSize+1) is the
-        color image, bottom half is per-block metadata. The blue channel of
-        the bottom half = surface y-level at that block.
+        color image, bottom half is per-block metadata. Surface Y is stored in
+        the bottom half as a SIGNED 16-bit int -- green = high byte, blue = low
+        byte (Y = (green << 8) | blue, two's-complement). Reading blue alone is
+        only correct when green == 0 (Y in 0..255); blocks below Y=0 (caves /
+        ravines / void edges) or above Y=255 carry a non-zero green byte.
 
         Window selection:
         - If radius_blocks is given (non-None), the sampled square is
@@ -323,14 +326,22 @@ class BlueMapClient:
                 if lx1 <= lx0 or lz1 <= lz0:
                     continue
                 meta = tile.crop((lx0, tile_size + 1 + lz0, lx1, tile_size + 1 + lz1))
-                blue = meta.split()[2].tobytes()
+                bands = meta.split()
+                green = bands[1].tobytes()
+                blue = bands[2].tobytes()
                 if not blue:
                     continue
                 samples += len(blue)
-                local_max = max(blue)
-                local_min = min(blue)
-                max_y = local_max if max_y is None else max(max_y, local_max)
-                min_y = local_min if min_y is None else min(min_y, local_min)
+                # Decode the signed 16-bit surface Y per pixel: green is the
+                # high byte, blue the low byte. Reading blue alone flips a deep
+                # block (e.g. Y=-59 -> 0xFFC5) into a bogus +197 peak that pins
+                # the altitude PID; the two-byte decode is the correct height.
+                for g, b in zip(green, blue):
+                    y = (g << 8) | b
+                    if y >= 32768:
+                        y -= 65536
+                    max_y = y if max_y is None else max(max_y, y)
+                    min_y = y if min_y is None else min(min_y, y)
         return {
             "groundMaxY": max_y,
             "groundMinY": min_y,
